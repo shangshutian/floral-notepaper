@@ -5,6 +5,8 @@ import { useTranslation } from "react-i18next";
 import { createNote, getErrorMessage, getNote, listNotes, updateNote } from "../features/notes/api";
 import { useImagePaste } from "../features/images/useImagePaste";
 import { useImageBaseDir } from "../features/images/useImageBaseDir";
+import { useMarkdownShortcutBindings } from "../features/markdown/useMarkdownShortcutBindings";
+import { useMarkdownShortcuts } from "../features/markdown/useMarkdownShortcuts";
 import { reportInstallPreparation } from "../features/update/api";
 import type { UpdateInstallPrepareRequest } from "../features/update/types";
 import { showToast } from "./Toast";
@@ -429,6 +431,21 @@ export function NotePad({
     onEnsureNoteSaved: ensureNoteSaved,
     onError: showToast,
     t,
+  });
+
+  const markContentDirty = useCallback(() => {
+    statusRef.current = "dirty";
+    setStatus("dirty");
+  }, []);
+
+  // 便签窗口是独立 WebView：快捷键只作用于它的正文 textarea（标题输入框不受影响）
+  const markdownShortcutBindings = useMarkdownShortcutBindings();
+  useMarkdownShortcuts({
+    textareaRef: contentRef,
+    setContent,
+    markDirty: markContentDirty,
+    translate: t,
+    bindings: markdownShortcutBindings,
   });
 
   const tileNoteId = editingNoteId ?? initialNoteId ?? "";

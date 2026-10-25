@@ -88,6 +88,10 @@ pub struct AppConfig {
     pub toggle_visibility_shortcut: String,
     #[serde(default = "default_open_at_cursor")]
     pub open_at_cursor: bool,
+    // Markdown 编辑快捷键覆盖项（id → 组合键）。缺省项由前端回落到内置默认，
+    // 因此这里只需要一个可缺省的字符串映射；旧 config.json 不带该字段也能加载。
+    #[serde(default)]
+    pub markdown_shortcuts: BTreeMap<String, String>,
     // Legacy fields — read from old config, never written back
     #[serde(default, skip_serializing)]
     pub notes_dir: Option<String>,
@@ -1163,6 +1167,7 @@ impl NoteStore {
             surface_height: None,
             toggle_visibility_shortcut: default_toggle_visibility_shortcut(),
             open_at_cursor: default_open_at_cursor(),
+            markdown_shortcuts: Default::default(),
             notes_dir: None,
             last_known_base_dir: None,
         }
@@ -1927,6 +1932,7 @@ mod tests {
             notes_dir: None,
             last_known_base_dir: None,
             open_at_cursor: true,
+            markdown_shortcuts: Default::default(),
         };
 
         store.save_config(saved.clone()).expect("save config");

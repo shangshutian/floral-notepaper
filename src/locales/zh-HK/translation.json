@@ -105,6 +105,7 @@
       "codeText": "程式碼",
       "headingText": "標題",
       "italicText": "斜體文字",
+      "linkText": "連結文字",
       "listItem": "清單項目",
       "quoteText": "引用文字"
     },
@@ -228,6 +229,30 @@
     },
     "dataDir": "數據目錄",
     "openAtCursor": "快捷鍵開啟時跟隨滑鼠位置",
+    "markdownShortcuts": {
+      "action": {
+        "bold": "粗體",
+        "heading1": "標題 1",
+        "heading2": "標題 2",
+        "heading3": "標題 3",
+        "heading4": "標題 4",
+        "heading5": "標題 5",
+        "heading6": "標題 6",
+        "italic": "斜體",
+        "link": "連結",
+        "ol": "有序清單",
+        "ul": "無序清單"
+      },
+      "description": "點擊組合鍵後按下新快捷鍵，Esc 取消。快捷鍵只在編輯區生效。",
+      "errorConflict": "與「{{action}}」衝突",
+      "errorNeedsModifier": "必須包含 Ctrl 或 Command",
+      "errorReserved": "該組合由編輯器保留（復原／儲存／剪貼簿），不能綁定",
+      "errorUnsupported": "不支援該按鍵，請用字母、數字或符號",
+      "recording": "按下組合鍵…",
+      "resetAll": "全部恢復預設",
+      "resetOne": "恢復預設",
+      "title": "Markdown 快捷鍵"
+    },
     "quickNoteShortcut": "快捷記錄快捷鍵",
     "rememberSurfaceSize": "記住小窗尺寸",
     "tabIndentSize": "Tab 縮排寬度",

@@ -32,6 +32,8 @@ export interface AppConfig {
   surfaceHeight?: number;
   toggleVisibilityShortcut: string;
   openAtCursor: boolean;
+  /** Markdown 编辑快捷键覆盖项（id → 组合键），缺省项回落到内置默认 */
+  markdownShortcuts?: Record<string, string>;
   backgroundImagePath?: string;
   backgroundFit?: BackgroundFit;
   backgroundDim?: number;

@@ -3,6 +3,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { checkGlobalShortcut, chooseBackgroundImage } from "../features/settings/api";
 import { UpdateSettingsSection } from "../features/update/UpdateSettingsSection";
+import { MarkdownShortcutsSection } from "../features/settings/MarkdownShortcutsSection";
 import type {
   AppConfig,
   BackgroundFit,
@@ -251,6 +252,8 @@ export function SettingsPanel({ config, onChange, onMigrateDataDir, onClose }: S
             />
           </div>
         </section>
+
+        <MarkdownShortcutsSection config={config} onChange={onChange} />
 
         <section className="space-y-2">
           <label className="block text-[11px] font-body text-ink-faint">

@@ -105,6 +105,7 @@
       "codeText": "代码",
       "headingText": "标题",
       "italicText": "斜体文本",
+      "linkText": "链接文本",
       "listItem": "列表项",
       "quoteText": "引用文本"
     },
@@ -228,6 +229,30 @@
     },
     "dataDir": "数据目录",
     "openAtCursor": "快捷键打开时跟随鼠标位置",
+    "markdownShortcuts": {
+      "action": {
+        "bold": "粗体",
+        "heading1": "标题 1",
+        "heading2": "标题 2",
+        "heading3": "标题 3",
+        "heading4": "标题 4",
+        "heading5": "标题 5",
+        "heading6": "标题 6",
+        "italic": "斜体",
+        "link": "链接",
+        "ol": "有序列表",
+        "ul": "无序列表"
+      },
+      "description": "点击组合键后按下新快捷键，Esc 取消。快捷键只在编辑区生效。",
+      "errorConflict": "与「{{action}}」冲突",
+      "errorNeedsModifier": "必须包含 Ctrl 或 Command",
+      "errorReserved": "该组合由编辑器保留（撤销/保存/剪贴板），不能绑定",
+      "errorUnsupported": "不支持该按键，请用字母、数字或符号",
+      "recording": "按下组合键…",
+      "resetAll": "全部恢复默认",
+      "resetOne": "恢复默认",
+      "title": "Markdown 快捷键"
+    },
     "quickNoteShortcut": "快捷记录快捷键",
     "rememberSurfaceSize": "记住小窗尺寸",
     "tabIndentSize": "Tab 缩进宽度",

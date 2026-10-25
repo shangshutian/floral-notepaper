@@ -105,6 +105,7 @@
       "codeText": "Code",
       "headingText": "Heading",
       "italicText": "Italic text",
+      "linkText": "Link text",
       "listItem": "List item",
       "quoteText": "Blockquote"
     },
@@ -228,6 +229,30 @@
     },
     "dataDir": "Data directory",
     "openAtCursor": "Open near cursor with shortcut",
+    "markdownShortcuts": {
+      "action": {
+        "bold": "Bold",
+        "heading1": "Heading 1",
+        "heading2": "Heading 2",
+        "heading3": "Heading 3",
+        "heading4": "Heading 4",
+        "heading5": "Heading 5",
+        "heading6": "Heading 6",
+        "italic": "Italic",
+        "link": "Link",
+        "ol": "Ordered list",
+        "ul": "Unordered list"
+      },
+      "description": "Click a shortcut, then press the new keys. Esc cancels. Shortcuts only apply inside the editor.",
+      "errorConflict": "Already used by {{action}}",
+      "errorNeedsModifier": "Must include Ctrl or Command",
+      "errorReserved": "Reserved by the editor (undo / save / clipboard)",
+      "errorUnsupported": "Unsupported key - use a letter, digit or symbol",
+      "recording": "Press keys…",
+      "resetAll": "Reset all",
+      "resetOne": "Reset to default",
+      "title": "Markdown shortcuts"
+    },
     "quickNoteShortcut": "Quick Note shortcut",
     "rememberSurfaceSize": "Remember surface size",
     "tabIndentSize": "Tab indent width",
