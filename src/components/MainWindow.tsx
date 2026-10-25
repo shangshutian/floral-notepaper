@@ -1430,7 +1430,6 @@ export function MainWindow({
     textareaRef: contentRef,
     setContent,
     markDirty,
-    translate: t,
     bindings: markdownShortcutBindings,
   });
 
@@ -2784,7 +2783,6 @@ export function MainWindow({
                                 applyMarkdownCommand(
                                   contentRef.current,
                                   button.action,
-                                  t,
                                   setContent,
                                   markDirty,
                                 );

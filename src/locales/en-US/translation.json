@@ -231,16 +231,21 @@
     "openAtCursor": "Open near cursor with shortcut",
     "markdownShortcuts": {
       "action": {
+        "blockMath": "Block math",
         "bold": "Bold",
+        "codeBlock": "Code block",
         "heading1": "Heading 1",
         "heading2": "Heading 2",
         "heading3": "Heading 3",
         "heading4": "Heading 4",
         "heading5": "Heading 5",
         "heading6": "Heading 6",
+        "inlineCode": "Inline code",
+        "inlineMath": "Inline math",
         "italic": "Italic",
         "link": "Link",
         "ol": "Ordered list",
+        "table": "Table",
         "ul": "Unordered list"
       },
       "description": "Click a shortcut, then press the new keys. Esc cancels. Shortcuts only apply inside the editor.",

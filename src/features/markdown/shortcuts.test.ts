@@ -51,22 +51,60 @@ describe("resolveMarkdownShortcut — default bindings", () => {
     });
   });
 
-  test("Ctrl+Shift+7 is an ordered list and Ctrl+Shift+8 an unordered list", () => {
-    expect(resolveMarkdownShortcut(key({ key: "&", code: "Digit7", shiftKey: true }))).toBe("ol");
-    expect(resolveMarkdownShortcut(key({ key: "*", code: "Digit8", shiftKey: true }))).toBe("ul");
+  test("Ctrl+Shift+1 is an unordered list and Ctrl+Shift+2 an ordered list", () => {
+    // Shift 改变 event.key（"1" → "!"），必须靠 Digit 还原
+    expect(resolveMarkdownShortcut(key({ key: "!", code: "Digit1", shiftKey: true }))).toBe("ul");
+    expect(resolveMarkdownShortcut(key({ key: "@", code: "Digit2", shiftKey: true }))).toBe("ol");
+  });
+
+  test("the retired Ctrl+Shift+7 / Ctrl+Shift+8 no longer resolve", () => {
+    expect(resolveMarkdownShortcut(key({ key: "&", code: "Digit7", shiftKey: true }))).toBeNull();
+    expect(resolveMarkdownShortcut(key({ key: "*", code: "Digit8", shiftKey: true }))).toBeNull();
   });
 
   test("Ctrl+0 / Ctrl+7 are not headings", () => {
     expect(resolveMarkdownShortcut(key({ key: "0", code: "Digit0" }))).toBeNull();
     expect(resolveMarkdownShortcut(key({ key: "7", code: "Digit7" }))).toBeNull();
   });
+
+  test("M1.1 defaults: inline code / code block / inline math / table", () => {
+    expect(resolveMarkdownShortcut(key({ key: "Q", code: "KeyQ", shiftKey: true }))).toBe(
+      "inlineCode",
+    );
+    expect(resolveMarkdownShortcut(key({ key: "W", code: "KeyW", shiftKey: true }))).toBe(
+      "codeBlock",
+    );
+    expect(resolveMarkdownShortcut(key({ key: "S", code: "KeyS", shiftKey: true }))).toBe(
+      "inlineMath",
+    );
+    expect(resolveMarkdownShortcut(key({ key: "B", code: "KeyB", shiftKey: true }))).toBe("table");
+  });
+
+  test("block math defaults to Ctrl+Shift+A, not the native redo combo", () => {
+    expect(resolveMarkdownShortcut(key({ key: "A", code: "KeyA", shiftKey: true }))).toBe(
+      "blockMath",
+    );
+    // Ctrl+Shift+Z 留给 WebView2 的原生重做
+    expect(resolveMarkdownShortcut(key({ key: "Z", code: "KeyZ", shiftKey: true }))).toBeNull();
+  });
+
+  test("the base Ctrl+Z / Ctrl+V / Ctrl+C / Ctrl+X still reach the editor", () => {
+    for (const [pressed, code] of [
+      ["z", "KeyZ"],
+      ["v", "KeyV"],
+      ["c", "KeyC"],
+      ["x", "KeyX"],
+    ] as const) {
+      expect(resolveMarkdownShortcut(key({ key: pressed, code }))).toBeNull();
+    }
+  });
 });
 
 describe("resolveMarkdownShortcut — custom bindings", () => {
   test("a rebound action answers on the new keys and drops the old ones", () => {
-    const bindings = { ...DEFAULT_MARKDOWN_SHORTCUTS, bold: "Ctrl+Shift+B" };
+    const bindings = { ...DEFAULT_MARKDOWN_SHORTCUTS, bold: "Ctrl+Alt+B" };
 
-    expect(resolveMarkdownShortcut(key({ key: "B", code: "KeyB", shiftKey: true }), bindings)).toBe(
+    expect(resolveMarkdownShortcut(key({ key: "B", code: "KeyB", altKey: true }), bindings)).toBe(
       "bold",
     );
     expect(resolveMarkdownShortcut(key({ key: "b", code: "KeyB" }), bindings)).toBeNull();
@@ -88,7 +126,7 @@ describe("resolveMarkdownShortcut — custom bindings", () => {
       "ul",
     );
     expect(
-      resolveMarkdownShortcut(key({ key: "*", code: "Digit8", shiftKey: true }), bindings),
+      resolveMarkdownShortcut(key({ key: "!", code: "Digit1", shiftKey: true }), bindings),
     ).toBeNull();
   });
 
@@ -100,6 +138,25 @@ describe("resolveMarkdownShortcut — custom bindings", () => {
     expect(bindings.italic).toBe("Ctrl+I");
     expect(resolveMarkdownShortcut(key({ key: "z", code: "KeyZ" }), bindings)).toBeNull();
     expect(resolveMarkdownShortcut(key({ key: "s", code: "KeyS" }), bindings)).toBeNull();
+  });
+
+  test("extended actions can be rebound and release the old keys", () => {
+    const bindings = resolveMarkdownShortcutBindings({ table: "Ctrl+Alt+T" });
+
+    expect(bindings.table).toBe("Ctrl+Alt+T");
+    expect(resolveMarkdownShortcut(key({ key: "T", code: "KeyT", altKey: true }), bindings)).toBe(
+      "table",
+    );
+    expect(resolveMarkdownShortcut(key({ key: "B", code: "KeyB", shiftKey: true }), bindings)).toBe(
+      null,
+    );
+  });
+
+  test("Ctrl+V cannot be taken, but the default inline-code slot is free of it", () => {
+    const blocked = resolveMarkdownShortcutBindings({ inlineCode: "Ctrl+V" });
+
+    expect(blocked.inlineCode).toBe("Ctrl+Shift+Q");
+    expect(blocked.link).toBe("Ctrl+K");
   });
 });
 

@@ -1,13 +1,8 @@
 import { afterEach, describe, expect, test, vi } from "vitest";
-import type { TFunction } from "i18next";
 import { applyMarkdownCommand, computeMarkdownEdit, type MarkdownCommand } from "./commands";
 
-// 只依赖 defaultValue 的翻译桩：断言时不引入 i18n 运行时
-const translate = ((key: string, options?: { defaultValue?: string }) =>
-  options?.defaultValue ?? key) as unknown as TFunction;
-
 function edit(value: string, start: number, end: number, command: MarkdownCommand) {
-  return computeMarkdownEdit(value, start, end, command, translate);
+  return computeMarkdownEdit(value, start, end, command);
 }
 
 function range(value: string, start: number, end: number, command: MarkdownCommand) {
@@ -78,11 +73,14 @@ describe("computeMarkdownEdit — inline formatting", () => {
     });
   });
 
-  test("bold without a selection inserts the localized sample", () => {
-    expect(edit("", 0, 0, "bold")).toMatchObject({
-      result: "**粗体文本**",
+  test("bold without a selection inserts bare markers with the caret between them", () => {
+    expect(edit("", 0, 0, "bold")).toEqual({
+      result: "****",
+      replaceStart: 0,
+      replaceEnd: 0,
+      replacement: "****",
       cursorStart: 2,
-      cursorEnd: 6,
+      cursorEnd: 2,
     });
   });
 
@@ -94,11 +92,11 @@ describe("computeMarkdownEdit — inline formatting", () => {
     });
   });
 
-  test("italic without a selection inserts the localized sample", () => {
+  test("italic without a selection inserts a bare pair", () => {
     expect(edit("", 0, 0, "italic")).toMatchObject({
-      result: "*斜体文本*",
+      result: "**",
       cursorStart: 1,
-      cursorEnd: 5,
+      cursorEnd: 1,
     });
   });
 
@@ -110,11 +108,14 @@ describe("computeMarkdownEdit — inline formatting", () => {
     });
   });
 
-  test("link without a selection inserts the localized label", () => {
-    expect(edit("", 0, 0, "link")).toMatchObject({
-      result: "[链接文本](url)",
-      cursorStart: 7,
-      cursorEnd: 10,
+  test("link without a selection inserts an empty link with the caret in the brackets", () => {
+    expect(edit("", 0, 0, "link")).toEqual({
+      result: "[]()",
+      replaceStart: 0,
+      replaceEnd: 0,
+      replacement: "[]()",
+      cursorStart: 1,
+      cursorEnd: 1,
     });
   });
 });
@@ -164,6 +165,14 @@ describe("computeMarkdownEdit — exact heading", () => {
       cursorEnd: 5,
     });
   });
+
+  test("an empty line gets the marker only, no sample title", () => {
+    expect(edit("", 0, 0, { type: "setHeading", level: 1 })).toMatchObject({
+      result: "# ",
+      cursorStart: 2,
+      cursorEnd: 2,
+    });
+  });
 });
 
 describe("computeMarkdownEdit — toolbar heading cycle is unchanged", () => {
@@ -190,14 +199,28 @@ describe("computeMarkdownEdit — toolbar heading cycle is unchanged", () => {
       cursorEnd: 6,
     });
   });
+
+  test("an empty line gains H2 without any sample text", () => {
+    expect(edit("", 0, 0, "heading")).toEqual({
+      result: "## ",
+      replaceStart: 0,
+      replaceEnd: 0,
+      replacement: "## ",
+      cursorStart: 3,
+      cursorEnd: 3,
+    });
+  });
 });
 
 describe("computeMarkdownEdit — block actions", () => {
-  test("unordered list wraps a single line", () => {
-    expect(edit("", 0, 0, "ul")).toMatchObject({
-      result: "- 列表项",
+  test("unordered list without a selection inserts a bare marker", () => {
+    expect(edit("", 0, 0, "ul")).toEqual({
+      result: "- ",
+      replaceStart: 0,
+      replaceEnd: 0,
+      replacement: "- ",
       cursorStart: 2,
-      cursorEnd: 5,
+      cursorEnd: 2,
     });
   });
 
@@ -225,6 +248,14 @@ describe("computeMarkdownEdit — block actions", () => {
     });
   });
 
+  test("ordered list without a selection inserts a bare marker", () => {
+    expect(edit("", 0, 0, "ol")).toMatchObject({
+      result: "1. ",
+      cursorStart: 3,
+      cursorEnd: 3,
+    });
+  });
+
   test("quote and inline code keep their upstream shapes", () => {
     expect(edit("x", 0, 1, "quote")).toMatchObject({
       result: "> x",
@@ -236,6 +267,11 @@ describe("computeMarkdownEdit — block actions", () => {
       cursorStart: 1,
       cursorEnd: 2,
     });
+  });
+
+  test("quote and code without a selection insert bare markers", () => {
+    expect(edit("", 0, 0, "quote")).toMatchObject({ result: "> ", cursorStart: 2, cursorEnd: 2 });
+    expect(edit("", 0, 0, "code")).toMatchObject({ result: "``", cursorStart: 1, cursorEnd: 1 });
   });
 
   test("horizontal rule is inserted at the cursor", () => {
@@ -264,7 +300,7 @@ describe("computeMarkdownEdit — minimal replace range (R2-A)", () => {
     expect(range("", 0, 0, "bold")).toEqual({
       replaceStart: 0,
       replaceEnd: 0,
-      replacement: "**粗体文本**",
+      replacement: "****",
     });
   });
 
@@ -341,7 +377,7 @@ describe("applyMarkdownCommand — native undo contract", () => {
 
     const setContent = vi.fn();
     const markDirty = vi.fn();
-    const applied = applyMarkdownCommand(textarea, "bold", translate, setContent, markDirty);
+    const applied = applyMarkdownCommand(textarea, "bold", setContent, markDirty);
 
     expect(applied).not.toBeNull();
     // 只替换选中那一段：既不是 [0, len]，也不是整篇内容
@@ -371,10 +407,10 @@ describe("applyMarkdownCommand — native undo contract", () => {
     vi.stubGlobal("document", { execCommand });
     vi.stubGlobal("requestAnimationFrame", () => 0);
 
-    applyMarkdownCommand(textarea, "italic", translate, vi.fn(), vi.fn());
+    applyMarkdownCommand(textarea, "italic", vi.fn(), vi.fn());
 
     expect(selectionAtExec).toEqual([5, 5]);
-    expect(execCommand).toHaveBeenCalledWith("insertText", false, "*斜体文本*");
+    expect(execCommand).toHaveBeenCalledWith("insertText", false, "**");
   });
 
   test("no-op commands never touch the DOM or the dirty state", () => {
@@ -384,7 +420,6 @@ describe("applyMarkdownCommand — native undo contract", () => {
     const result = applyMarkdownCommand(
       textarea,
       { type: "setHeading", level: 2 },
-      translate,
       setContent,
       markDirty,
     );
@@ -393,5 +428,208 @@ describe("applyMarkdownCommand — native undo contract", () => {
     expect(execCommand).not.toHaveBeenCalled();
     expect(setContent).not.toHaveBeenCalled();
     expect(markDirty).not.toHaveBeenCalled();
+  });
+});
+
+describe("computeMarkdownEdit — M1.1 inline code", () => {
+  test("wraps the selection in backticks and keeps it selected", () => {
+    expect(edit("hello", 0, 5, "inlineCode")).toEqual({
+      result: "`hello`",
+      replaceStart: 0,
+      replaceEnd: 5,
+      replacement: "`hello`",
+      cursorStart: 1,
+      cursorEnd: 6,
+    });
+  });
+
+  test("without a selection it inserts a bare backtick pair", () => {
+    expect(edit("", 0, 0, "inlineCode")).toEqual({
+      result: "``",
+      replaceStart: 0,
+      replaceEnd: 0,
+      replacement: "``",
+      cursorStart: 1,
+      cursorEnd: 1,
+    });
+  });
+
+  test("stays inline even when the selection spans lines", () => {
+    // Toolbar 的 code action 会切成围栏代码块，inlineCode 不允许这样
+    expect(edit("a\nb", 0, 3, "inlineCode")?.result).toBe("`a\nb`");
+  });
+});
+
+describe("computeMarkdownEdit — M1.1 fenced code block", () => {
+  test("wraps the selection in a fence and keeps it selected", () => {
+    expect(edit("hello", 0, 5, "codeBlock")).toEqual({
+      result: "```\nhello\n```",
+      replaceStart: 0,
+      replaceEnd: 5,
+      replacement: "```\nhello\n```",
+      cursorStart: 4,
+      cursorEnd: 9,
+    });
+  });
+
+  test("without a selection the caret lands inside the empty code area", () => {
+    expect(edit("", 0, 0, "codeBlock")).toMatchObject({
+      result: "```\n\n```",
+      cursorStart: 4,
+      cursorEnd: 4,
+    });
+  });
+
+  test("adds the surrounding newline only when the fence would be glued to text", () => {
+    expect(edit("abc", 3, 3, "codeBlock")?.result).toBe("abc\n```\n\n```");
+    expect(edit("abc\n", 4, 4, "codeBlock")?.result).toBe("abc\n```\n\n```");
+  });
+});
+
+describe("computeMarkdownEdit — M1.1 inline math", () => {
+  test("wraps the selection and selects the formula", () => {
+    expect(edit("E=mc^2", 0, 6, "inlineMath")).toEqual({
+      result: "$E=mc^2$",
+      replaceStart: 0,
+      replaceEnd: 6,
+      replacement: "$E=mc^2$",
+      cursorStart: 1,
+      cursorEnd: 7,
+    });
+  });
+
+  test("without a selection it inserts a bare dollar pair", () => {
+    expect(edit("", 0, 0, "inlineMath")).toEqual({
+      result: "$$",
+      replaceStart: 0,
+      replaceEnd: 0,
+      replacement: "$$",
+      cursorStart: 1,
+      cursorEnd: 1,
+    });
+  });
+});
+
+describe("computeMarkdownEdit — M1.1 block math", () => {
+  test("wraps a whole-line selection into a display block", () => {
+    expect(edit("E=mc^2", 0, 6, "blockMath")).toEqual({
+      result: "$$\nE=mc^2\n$$",
+      replaceStart: 0,
+      replaceEnd: 6,
+      replacement: "$$\nE=mc^2\n$$",
+      cursorStart: 3,
+      cursorEnd: 9,
+    });
+  });
+
+  test("the $$ markers get their own lines when the caret sits mid-line", () => {
+    // remark-math 只把行首的 $$ 当作块级公式，所以必须补前导换行
+    expect(edit("abc", 3, 3, "blockMath")?.result).toBe("abc\n$$\n\n$$");
+  });
+
+  test("without a selection the caret is placed inside the empty block", () => {
+    const applied = edit("", 0, 0, "blockMath");
+    expect(applied?.result).toBe("$$\n\n$$");
+    expect(applied?.cursorStart).toBe(3);
+    expect(applied?.cursorEnd).toBe(3);
+  });
+
+  test("a block inserted between two paragraphs keeps them separated", () => {
+    expect(edit("a\nb", 1, 1, "blockMath")?.result).toBe("a\n$$\n\n$$\nb");
+  });
+});
+
+describe("computeMarkdownEdit — M1.1 table", () => {
+  const TABLE = "|  |  |\n| --- | --- |\n|  |  |";
+
+  test("inserts an empty 2x2 gfm table with a bare caret", () => {
+    expect(edit("", 0, 0, "table")).toEqual({
+      result: TABLE,
+      replaceStart: 0,
+      replaceEnd: 0,
+      replacement: TABLE,
+      cursorStart: 2,
+      cursorEnd: 2,
+    });
+  });
+
+  test("keeps the table on its own lines when inserted mid-text", () => {
+    expect(edit("x", 1, 1, "table")?.result).toBe(`x\n${TABLE}`);
+    expect(edit("x", 0, 0, "table")?.result).toBe(`${TABLE}\nx`);
+  });
+
+  test("the caret lands inside the first header cell", () => {
+    const applied = edit("", 0, 0, "table");
+    expect(applied?.cursorStart).toBe(2);
+    expect(applied?.cursorEnd).toBe(2);
+    // `|  |  |` 的前两个字符正是第一个单元格的空位
+    expect(applied?.result.slice(0, applied.cursorStart)).toBe("| ");
+  });
+
+  test("the table carries no sample cells at all", () => {
+    const applied = edit("", 0, 0, "table");
+    expect(applied?.result).not.toContain("Header");
+    expect(applied?.result).not.toContain("Cell");
+  });
+});
+
+describe("applyMarkdownCommand — M1.1 keeps the native undo contract", () => {
+  test("a table insertion replaces nothing and touches only the caret", () => {
+    const { execCommand, setContent, markDirty } = stubEditorGlobals();
+    const textarea = makeTextarea("abc", 3, 3);
+    const ranges: number[][] = [];
+    textarea.setSelectionRange = (start: number, end: number) => {
+      ranges.push([start, end]);
+      textarea.selectionStart = start;
+      textarea.selectionEnd = end;
+    };
+
+    const applied = applyMarkdownCommand(textarea, "table", setContent, markDirty);
+
+    expect(applied).not.toBeNull();
+    expect(ranges[0]).toEqual([3, 3]);
+    expect(execCommand).toHaveBeenCalledTimes(1);
+    expect(setContent).toHaveBeenCalledTimes(1);
+    expect(markDirty).toHaveBeenCalledTimes(1);
+  });
+
+  test("inline code only replaces the selected range", () => {
+    const { execCommand } = stubEditorGlobals();
+    const textarea = makeTextarea("abc hello def", 4, 9);
+    const ranges: number[][] = [];
+    textarea.setSelectionRange = (start: number, end: number) => {
+      ranges.push([start, end]);
+      textarea.selectionStart = start;
+      textarea.selectionEnd = end;
+    };
+
+    applyMarkdownCommand(textarea, "inlineCode", vi.fn(), vi.fn());
+
+    expect(ranges[0]).toEqual([4, 9]);
+    expect(execCommand).toHaveBeenCalledWith("insertText", false, "`hello`");
+  });
+});
+
+describe("no command invents sample content", () => {
+  const commands: MarkdownCommand[] = [
+    "bold",
+    "italic",
+    "link",
+    "heading",
+    "ul",
+    "ol",
+    "code",
+    "quote",
+    "inlineCode",
+    "inlineMath",
+    "blockMath",
+    "codeBlock",
+    "table",
+  ];
+
+  test.each(commands)("%s leaves no CJK placeholder behind", (command) => {
+    const result = edit("", 0, 0, command);
+    expect(result).not.toBeNull();
+    expect(result?.result ?? "").not.toMatch(/[\u4e00-\u9fa5]/);
   });
 });

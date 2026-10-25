@@ -1,6 +1,5 @@
 import { useEffect, useRef } from "react";
 import type { RefObject } from "react";
-import type { TFunction } from "i18next";
 import { applyMarkdownCommand, type MarkdownEdit } from "./commands";
 import { DEFAULT_MARKDOWN_SHORTCUTS, type MarkdownShortcutBindings } from "./shortcutBindings";
 import { resolveMarkdownShortcut } from "./shortcuts";
@@ -17,7 +16,6 @@ import { resolveMarkdownShortcut } from "./shortcuts";
 export interface MarkdownShortcutDependencies {
   setContent: (value: string) => void;
   markDirty: () => void;
-  translate: TFunction;
   enabled?: boolean;
   bindings?: MarkdownShortcutBindings;
 }
@@ -56,7 +54,6 @@ export function createMarkdownShortcutHandler(
     const edit = applyMarkdownCommand(
       textarea,
       command,
-      dependencies.translate,
       dependencies.setContent,
       dependencies.markDirty,
     );
@@ -104,7 +101,6 @@ export interface UseMarkdownShortcutsOptions {
   textareaRef: RefObject<HTMLTextAreaElement | null>;
   setContent: (value: string) => void;
   markDirty: () => void;
-  translate: TFunction;
   bindings?: MarkdownShortcutBindings;
   enabled?: boolean;
 }
@@ -113,7 +109,6 @@ export function useMarkdownShortcuts({
   textareaRef,
   setContent,
   markDirty,
-  translate,
   bindings = DEFAULT_MARKDOWN_SHORTCUTS,
   enabled = true,
 }: UseMarkdownShortcutsOptions) {
@@ -121,11 +116,10 @@ export function useMarkdownShortcuts({
   const dependenciesRef = useRef<MarkdownShortcutDependencies>({
     setContent,
     markDirty,
-    translate,
     bindings,
     enabled,
   });
-  dependenciesRef.current = { setContent, markDirty, translate, bindings, enabled };
+  dependenciesRef.current = { setContent, markDirty, bindings, enabled };
 
   // 最近一次 command 的落点，仅供 undo 选区兜底使用（不是 undo 历史）
   const lastEditRef = useRef<{ start: number } | null>(null);

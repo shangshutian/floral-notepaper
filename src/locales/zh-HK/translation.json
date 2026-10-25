@@ -231,16 +231,21 @@
     "openAtCursor": "快捷鍵開啟時跟隨滑鼠位置",
     "markdownShortcuts": {
       "action": {
+        "blockMath": "區塊公式",
         "bold": "粗體",
+        "codeBlock": "程式碼區塊",
         "heading1": "標題 1",
         "heading2": "標題 2",
         "heading3": "標題 3",
         "heading4": "標題 4",
         "heading5": "標題 5",
         "heading6": "標題 6",
+        "inlineCode": "行內程式碼",
+        "inlineMath": "行內公式",
         "italic": "斜體",
         "link": "連結",
         "ol": "有序清單",
+        "table": "表格",
         "ul": "無序清單"
       },
       "description": "點擊組合鍵後按下新快捷鍵，Esc 取消。快捷鍵只在編輯區生效。",

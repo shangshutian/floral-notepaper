@@ -72,6 +72,10 @@ describe("bindingFromShortcutEvent", () => {
   });
 
   test("digit rows use the digit, not the shifted symbol", () => {
+    // Ctrl+Shift+1 在 US 布局下 event.key 是 "!"，必须靠 Digit1 还原成 "1"
+    expect(
+      bindingFromShortcutEvent({ key: "!", code: "Digit1", ctrlKey: true, shiftKey: true }),
+    ).toEqual({ status: "ok", binding: "Ctrl+Shift+1" });
     expect(
       bindingFromShortcutEvent({ key: "&", code: "Digit7", ctrlKey: true, shiftKey: true }),
     ).toEqual({ status: "ok", binding: "Ctrl+Shift+7" });
@@ -114,14 +118,16 @@ describe("isReservedMarkdownBinding", () => {
     expect(isReservedMarkdownBinding("Ctrl+Y")).toBe(true);
     expect(isReservedMarkdownBinding("Ctrl+S")).toBe(true);
     expect(isReservedMarkdownBinding("Ctrl+B")).toBe(false);
-    expect(isReservedMarkdownBinding("Ctrl+Shift+7")).toBe(false);
+    expect(isReservedMarkdownBinding("Ctrl+Shift+1")).toBe(false);
   });
 });
 
 describe("findShortcutConflict", () => {
   test("detects a binding already used by another action", () => {
     expect(findShortcutConflict(DEFAULT_MARKDOWN_SHORTCUTS, "bold", "Ctrl+I")).toBe("italic");
-    expect(findShortcutConflict(DEFAULT_MARKDOWN_SHORTCUTS, "bold", "Ctrl+Shift+B")).toBeNull();
+    // Ctrl+Shift+B 在 M1.1 之后归表格所有
+    expect(findShortcutConflict(DEFAULT_MARKDOWN_SHORTCUTS, "bold", "Ctrl+Shift+B")).toBe("table");
+    expect(findShortcutConflict(DEFAULT_MARKDOWN_SHORTCUTS, "bold", "Ctrl+Shift+U")).toBeNull();
   });
 
   test("ignores the action's own current binding", () => {
@@ -137,9 +143,9 @@ describe("resolveMarkdownShortcutBindings", () => {
   });
 
   test("applies valid overrides on top of the defaults", () => {
-    const bindings = resolveMarkdownShortcutBindings({ bold: "Ctrl+Shift+B", ul: "Ctrl+Shift+U" });
+    const bindings = resolveMarkdownShortcutBindings({ bold: "Ctrl+Alt+B", ul: "Ctrl+Shift+U" });
 
-    expect(bindings.bold).toBe("Ctrl+Shift+B");
+    expect(bindings.bold).toBe("Ctrl+Alt+B");
     expect(bindings.ul).toBe("Ctrl+Shift+U");
     expect(bindings.italic).toBe("Ctrl+I");
   });
@@ -179,5 +185,118 @@ describe("commandForShortcutId", () => {
     expect(commandForShortcutId("ul")).toBe("ul");
     expect(commandForShortcutId("heading6")).toEqual({ type: "setHeading", level: 6 });
     expect(commandForShortcutId("heading1")).toEqual({ type: "setHeading", level: 1 });
+  });
+
+  test("maps the M1.1 ids to their commands", () => {
+    expect(commandForShortcutId("inlineCode")).toBe("inlineCode");
+    expect(commandForShortcutId("codeBlock")).toBe("codeBlock");
+    expect(commandForShortcutId("inlineMath")).toBe("inlineMath");
+    expect(commandForShortcutId("blockMath")).toBe("blockMath");
+    expect(commandForShortcutId("table")).toBe("table");
+  });
+});
+
+describe("M1.1 defaults", () => {
+  test("list, code and math actions ship with the shortcut table from the spec", () => {
+    expect(DEFAULT_MARKDOWN_SHORTCUTS.ul).toBe("Ctrl+Shift+1");
+    expect(DEFAULT_MARKDOWN_SHORTCUTS.ol).toBe("Ctrl+Shift+2");
+    expect(DEFAULT_MARKDOWN_SHORTCUTS.inlineCode).toBe("Ctrl+Shift+Q");
+    expect(DEFAULT_MARKDOWN_SHORTCUTS.codeBlock).toBe("Ctrl+Shift+W");
+    expect(DEFAULT_MARKDOWN_SHORTCUTS.blockMath).toBe("Ctrl+Shift+A");
+    expect(DEFAULT_MARKDOWN_SHORTCUTS.inlineMath).toBe("Ctrl+Shift+S");
+    expect(DEFAULT_MARKDOWN_SHORTCUTS.table).toBe("Ctrl+Shift+B");
+  });
+
+  test("the settings panel renders digits and letters consistently", () => {
+    expect(formatMarkdownBinding(DEFAULT_MARKDOWN_SHORTCUTS.ul)).toBe("Ctrl + Shift + 1");
+    expect(formatMarkdownBinding(DEFAULT_MARKDOWN_SHORTCUTS.inlineCode)).toBe("Ctrl + Shift + Q");
+    expect(formatMarkdownBinding(DEFAULT_MARKDOWN_SHORTCUTS.blockMath)).toBe("Ctrl + Shift + A");
+  });
+
+  test("block math avoids Ctrl+Shift+Z because that is native redo", () => {
+    // Chromium / WebView2 在可编辑区域用 Ctrl+Shift+Z 做重做，
+    // 默认值必须让开，否则会破坏 undo → redo 的肌肉记忆
+    expect(DEFAULT_MARKDOWN_SHORTCUTS.blockMath).not.toBe("Ctrl+Shift+Z");
+  });
+
+  test("every default is unique after normalization", () => {
+    const seen = new Set(
+      MARKDOWN_SHORTCUT_IDS.map((id) => normalizeMarkdownBinding(DEFAULT_MARKDOWN_SHORTCUTS[id])),
+    );
+    expect(seen.size).toBe(MARKDOWN_SHORTCUT_IDS.length);
+  });
+
+  test("no default is a reserved combination", () => {
+    for (const id of MARKDOWN_SHORTCUT_IDS) {
+      expect(isReservedMarkdownBinding(DEFAULT_MARKDOWN_SHORTCUTS[id])).toBe(false);
+    }
+  });
+});
+
+describe("reserved combinations — shift variants are not reserved", () => {
+  test("base Ctrl+key stays reserved", () => {
+    for (const pressed of ["z", "y", "a", "c", "v", "x", "s"]) {
+      expect(isReservedMarkdownBinding(`Ctrl+${pressed.toUpperCase()}`)).toBe(true);
+    }
+  });
+
+  test("shift variants of reserved base keys stay bindable", () => {
+    // Ctrl+A / Ctrl+S 是保留组合，但加上 Shift 就是另一个组合：
+    // 块级公式默认 Ctrl+Shift+A、行内公式默认 Ctrl+Shift+S 正依赖这一点
+    for (const binding of [
+      "Ctrl+Shift+Z",
+      "Ctrl+Shift+Q",
+      "Ctrl+Shift+W",
+      "Ctrl+Shift+A",
+      "Ctrl+Shift+S",
+      "Ctrl+Shift+B",
+    ]) {
+      expect(isReservedMarkdownBinding(binding)).toBe(false);
+    }
+    expect(
+      bindingFromShortcutEvent({ key: "A", code: "KeyA", ctrlKey: true, shiftKey: true }),
+    ).toEqual({ status: "ok", binding: "Ctrl+Shift+A" });
+    expect(
+      bindingFromShortcutEvent({ key: "S", code: "KeyS", ctrlKey: true, shiftKey: true }),
+    ).toEqual({ status: "ok", binding: "Ctrl+Shift+S" });
+  });
+
+  test("Alt variants are bindable too", () => {
+    expect(isReservedMarkdownBinding("Ctrl+Alt+V")).toBe(false);
+  });
+
+  test("the capture flow accepts Ctrl+Shift+B even though Ctrl+B is taken", () => {
+    // Ctrl+B 是粗体，但 Ctrl+Shift+B 是另一个组合，表格默认就用它
+    expect(
+      bindingFromShortcutEvent({ key: "B", code: "KeyB", ctrlKey: true, shiftKey: true }),
+    ).toEqual({ status: "ok", binding: "Ctrl+Shift+B" });
+  });
+});
+
+describe("conflicts across the extended actions", () => {
+  test("table owns Ctrl+Shift+B, so inline code cannot take it", () => {
+    expect(findShortcutConflict(DEFAULT_MARKDOWN_SHORTCUTS, "inlineCode", "Ctrl+Shift+B")).toBe(
+      "table",
+    );
+  });
+
+  test("a shift variant does not collide with its base binding", () => {
+    // Ctrl+B 是粗体 / Ctrl+Shift+B 是表格：同一 base key 的两个不同组合，互不影响
+    expect(findShortcutConflict(DEFAULT_MARKDOWN_SHORTCUTS, "table", "Ctrl+Shift+B")).toBeNull();
+    expect(findShortcutConflict(DEFAULT_MARKDOWN_SHORTCUTS, "bold", "Ctrl+Shift+B")).toBe("table");
+    expect(findShortcutConflict(DEFAULT_MARKDOWN_SHORTCUTS, "table", "Ctrl+Shift+A")).toBe(
+      "blockMath",
+    );
+  });
+
+  test("config overrides survive for the extended actions", () => {
+    const bindings = resolveMarkdownShortcutBindings({
+      table: "Ctrl+Alt+T",
+      blockMath: "Ctrl+Shift+Z",
+    });
+
+    expect(bindings.table).toBe("Ctrl+Alt+T");
+    // Ctrl+Shift+Z 不是保留组合，用户可以自己承担覆盖 redo 的后果
+    expect(bindings.blockMath).toBe("Ctrl+Shift+Z");
   });
 });

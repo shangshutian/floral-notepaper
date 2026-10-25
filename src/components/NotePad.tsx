@@ -444,7 +444,6 @@ export function NotePad({
     textareaRef: contentRef,
     setContent,
     markDirty: markContentDirty,
-    translate: t,
     bindings: markdownShortcutBindings,
   });
 

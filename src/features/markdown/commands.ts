@@ -1,12 +1,15 @@
-import type { TFunction } from "i18next";
-
 /**
  * Markdown 编辑 command 层。
  *
  * Toolbar 按钮与键盘快捷键都只能经由 {@link applyMarkdownCommand} 修改编辑器内容，
  * 不允许各自实现一套字符串拼接逻辑。
  *
- * Undo 语义：整篇内容通过一次 `execCommand("insertText")` 替换，
+ * 无选区时的统一原则：**只插入最小合法 Markdown 结构，不生成任何示例文本**。
+ * 早期实现会插入「粗体文本」「列表项」这类占位内容，但占位文字会被当成真实笔记内容，
+ * 用户必须先删掉才能写 —— 现在所有成对标记都插成空壳（`****` / `**` / `` `` `` / `$$`），
+ * 块级语法插成空块，光标直接落在可输入位置。`translate` 参数因此不再需要。
+ *
+ * Undo 语义：只替换最小编辑区间，并通过一次 `execCommand("insertText")` 应用，
  * 这样一次 Markdown 操作在 native textarea undo 栈里只对应一个条目，
  * `Ctrl+Z` 可以一次性撤销。**不要**改成 setContent() 或纯字符串 splice。
  */
@@ -22,10 +25,17 @@ export type MarkdownAction =
   | "hr"
   | "ul"
   | "ol"
+  /** Toolbar 的代码按钮：单行→行内代码，多行/跨行选区→围栏代码块 */
   | "code"
   | "quote"
   | "inlineMath"
   | "blockMath"
+  /** 行内代码：无论选区是否跨行都只加一对反引号 */
+  | "inlineCode"
+  /** 围栏代码块：始终是 ``` 块 */
+  | "codeBlock"
+  /** 插入 2×2 GFM 表格并选中第一个表头单元格 */
+  | "table"
   | "link";
 
 /** 精确设置标题级别：`Ctrl+1`~`Ctrl+6`，同级再次执行是 no-op。 */
@@ -107,6 +117,20 @@ function headingPrefix(level: number): string {
 }
 
 /**
+ * 块级插入的前后换行。
+ *
+ * 块级语法（`$$` / ``` / 表格）必须独占行首行尾，否则会被当成上一段正文的一部分。
+ * 只在**需要**时补一个换行：光标本来就在行首 / 行尾时不再多插空行，
+ * 这样 `E=mc^2` 整行选中后得到的就是 `$$\nE=mc^2\n$$`。
+ */
+function blockPadding(before: string, after: string): { lead: string; trail: string } {
+  return {
+    lead: before === "" || before.endsWith("\n") ? "" : "\n",
+    trail: after === "" || after.startsWith("\n") ? "" : "\n",
+  };
+}
+
+/**
  * 纯函数：给定内容与选区，算出新内容与执行后的光标位置。
  * 返回 `null` 表示该 command 在当前状态下是 no-op（例如标题级别已相同）。
  */
@@ -115,7 +139,6 @@ export function computeMarkdownEdit(
   start: number,
   end: number,
   command: MarkdownCommand,
-  translate: TFunction,
 ): MarkdownEdit | null {
   const selected = value.slice(start, end);
   const before = value.slice(0, start);
@@ -156,28 +179,28 @@ export function computeMarkdownEdit(
   } else {
     switch (command) {
       case "bold": {
-        const fallback = translate("main.formatSample.boldText", { defaultValue: "粗体文本" });
-        const wrapped = `**${selected || fallback}**`;
-        result = before + wrapped + after;
+        result = `${before}**${selected}**${after}`;
         cursorStart = start + 2;
-        cursorEnd = cursorStart + (selected || fallback).length;
+        cursorEnd = cursorStart + selected.length;
         break;
       }
       case "italic": {
-        const fallback = translate("main.formatSample.italicText", { defaultValue: "斜体文本" });
-        const wrapped = `*${selected || fallback}*`;
-        result = before + wrapped + after;
+        result = `${before}*${selected}*${after}`;
         cursorStart = start + 1;
-        cursorEnd = cursorStart + (selected || fallback).length;
+        cursorEnd = cursorStart + selected.length;
         break;
       }
       case "link": {
-        const fallback = translate("main.formatSample.linkText", { defaultValue: "链接文本" });
-        const label = selected || fallback;
-        result = before + `[${label}](url)` + after;
-        // 把占位的 url 选中，直接输入或粘贴即可替换
-        cursorStart = start + label.length + 3;
-        cursorEnd = cursorStart + 3;
+        if (selected) {
+          result = `${before}[${selected}](url)${after}`;
+          // 把 url 占位选中，直接输入或粘贴即可替换
+          cursorStart = start + selected.length + 3;
+          cursorEnd = cursorStart + 3;
+        } else {
+          // 无选区：只有 `[]()` 骨架，光标停在方括号内
+          result = `${before}[]()${after}`;
+          cursorStart = cursorEnd = start + 1;
+        }
         break;
       }
       case "heading": {
@@ -199,12 +222,9 @@ export function computeMarkdownEdit(
           cursorStart = start + 3;
           cursorEnd = cursorStart + selected.length;
         } else {
-          result =
-            before +
-            `## ${translate("main.formatSample.headingText", { defaultValue: "标题" })}` +
-            after;
-          cursorStart = start + 3;
-          cursorEnd = cursorStart + 2;
+          // 无选区：只补标题记号，光标在记号之后
+          result = `${before}## ${after}`;
+          cursorStart = cursorEnd = start + 3;
         }
         break;
       }
@@ -225,11 +245,9 @@ export function computeMarkdownEdit(
           cursorStart = start;
           cursorEnd = start + lines.length;
         } else {
-          const fallback = translate("main.formatSample.listItem", { defaultValue: "列表项" });
-          const item = `- ${selected || fallback}`;
-          result = before + item + after;
+          result = `${before}- ${selected}${after}`;
           cursorStart = start + 2;
-          cursorEnd = cursorStart + (selected || fallback).length;
+          cursorEnd = cursorStart + selected.length;
         }
         break;
       }
@@ -243,11 +261,9 @@ export function computeMarkdownEdit(
           cursorStart = start;
           cursorEnd = start + lines.length;
         } else {
-          const fallback = translate("main.formatSample.listItem", { defaultValue: "列表项" });
-          const item = `1. ${selected || fallback}`;
-          result = before + item + after;
+          result = `${before}1. ${selected}${after}`;
           cursorStart = start + 3;
-          cursorEnd = cursorStart + (selected || fallback).length;
+          cursorEnd = cursorStart + selected.length;
         }
         break;
       }
@@ -258,11 +274,9 @@ export function computeMarkdownEdit(
           cursorStart = start + 4;
           cursorEnd = cursorStart + selected.length;
         } else {
-          const fallback = translate("main.formatSample.codeText", { defaultValue: "代码" });
-          const wrapped = `\`${selected || fallback}\``;
-          result = before + wrapped + after;
+          result = `${before}\`${selected}\`${after}`;
           cursorStart = start + 1;
-          cursorEnd = cursorStart + (selected || fallback).length;
+          cursorEnd = cursorStart + selected.length;
         }
         break;
       }
@@ -276,26 +290,46 @@ export function computeMarkdownEdit(
           cursorStart = start;
           cursorEnd = start + lines.length;
         } else {
-          const fallback = translate("main.formatSample.quoteText", { defaultValue: "引用文本" });
-          const item = `> ${selected || fallback}`;
-          result = before + item + after;
+          result = `${before}> ${selected}${after}`;
           cursorStart = start + 2;
-          cursorEnd = cursorStart + (selected || fallback).length;
+          cursorEnd = cursorStart + selected.length;
         }
         break;
       }
       case "inlineMath": {
-        const wrapped = `$${selected || "E=mc^2"}$`;
-        result = before + wrapped + after;
+        result = `${before}$${selected}$${after}`;
         cursorStart = start + 1;
-        cursorEnd = cursorStart + (selected || "E=mc^2").length;
+        cursorEnd = cursorStart + selected.length;
         break;
       }
       case "blockMath": {
-        const wrapped = `\n$$\n${selected || "x^2 + y^2 = r^2"}\n$$\n`;
-        result = before + wrapped + after;
-        cursorStart = start + 4;
-        cursorEnd = cursorStart + (selected || "x^2 + y^2 = r^2").length;
+        const { lead, trail } = blockPadding(before, after);
+        result = `${before}${lead}$$\n${selected}\n$$${trail}${after}`;
+        // 光标落在 `$$` 之后、公式正文之前
+        cursorStart = start + lead.length + 3;
+        cursorEnd = cursorStart + selected.length;
+        break;
+      }
+      case "inlineCode": {
+        result = `${before}\`${selected}\`${after}`;
+        cursorStart = start + 1;
+        cursorEnd = cursorStart + selected.length;
+        break;
+      }
+      case "codeBlock": {
+        const { lead, trail } = blockPadding(before, after);
+        // 无选区时留空正文，光标直接停在可以输入代码的那一行
+        result = `${before}${lead}\`\`\`\n${selected}\n\`\`\`${trail}${after}`;
+        cursorStart = start + lead.length + 4;
+        cursorEnd = cursorStart + selected.length;
+        break;
+      }
+      case "table": {
+        const { lead, trail } = blockPadding(before, after);
+        // 空 2×2 GFM 表：只有结构，不含任何示例文本
+        result = `${before}${lead}|  |  |\n| --- | --- |\n|  |  |${trail}${after}`;
+        // 光标落在第一个表头单元格内
+        cursorStart = cursorEnd = start + lead.length + 2;
         break;
       }
     }
@@ -317,12 +351,11 @@ export function computeMarkdownEdit(
 export function applyMarkdownCommand(
   textarea: HTMLTextAreaElement,
   command: MarkdownCommand,
-  translate: TFunction,
   setContent: (value: string) => void,
   markDirty: () => void,
 ): MarkdownEdit | null {
   const { selectionStart: start, selectionEnd: end, value } = textarea;
-  const edit = computeMarkdownEdit(value, start, end, command, translate);
+  const edit = computeMarkdownEdit(value, start, end, command);
   if (!edit) return null;
 
   const { result, replaceStart, replaceEnd, replacement, cursorStart, cursorEnd } = edit;

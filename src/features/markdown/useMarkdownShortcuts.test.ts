@@ -1,11 +1,7 @@
 import { afterEach, describe, expect, test, vi } from "vitest";
-import type { TFunction } from "i18next";
 import { DEFAULT_MARKDOWN_SHORTCUTS } from "./shortcutBindings";
 import { createMarkdownShortcutHandler, createUndoSelectionGuard } from "./useMarkdownShortcuts";
 import type { MarkdownShortcutDependencies } from "./useMarkdownShortcuts";
-
-const translate = ((key: string, options?: { defaultValue?: string }) =>
-  options?.defaultValue ?? key) as unknown as TFunction;
 
 interface FakeTextarea {
   value: string;
@@ -77,7 +73,7 @@ function makeDependencies(
 } {
   const setContent = vi.fn();
   const markDirty = vi.fn();
-  return { setContent, markDirty, translate, ...overrides } as MarkdownShortcutDependencies & {
+  return { setContent, markDirty, ...overrides } as MarkdownShortcutDependencies & {
     setContent: ReturnType<typeof vi.fn>;
     markDirty: ReturnType<typeof vi.fn>;
   };
@@ -144,6 +140,68 @@ describe("createMarkdownShortcutHandler — dispatch", () => {
     handler(newBinding.event);
     expect(newBinding.preventDefault).toHaveBeenCalledTimes(1);
     expect(execCommand).toHaveBeenCalledWith("insertText", false, "**hi**");
+  });
+
+  test("M1.1 shortcuts reach the same command layer", () => {
+    const TABLE = "|  |  |\n| --- | --- |\n|  |  |";
+
+    const inlineCode = stubEditorGlobals();
+    const codeTextarea = makeTextarea("hi", 0, 2);
+    const codeDeps = makeDependencies();
+    createMarkdownShortcutHandler({
+      getTextarea: () => codeTextarea,
+      getDependencies: () => codeDeps,
+    })(makeEvent(codeTextarea, { key: "Q", code: "KeyQ", shiftKey: true }).event);
+    expect(inlineCode.execCommand).toHaveBeenCalledWith("insertText", false, "`hi`");
+    expect(codeDeps.setContent).toHaveBeenCalledWith("`hi`");
+
+    vi.unstubAllGlobals();
+    const tableGlobals = stubEditorGlobals();
+    const tableTextarea = makeTextarea("", 0, 0);
+    const tableDeps = makeDependencies();
+    createMarkdownShortcutHandler({
+      getTextarea: () => tableTextarea,
+      getDependencies: () => tableDeps,
+    })(makeEvent(tableTextarea, { key: "B", code: "KeyB", shiftKey: true }).event);
+    expect(tableGlobals.execCommand).toHaveBeenCalledWith("insertText", false, TABLE);
+    expect(tableDeps.setContent).toHaveBeenCalledWith(TABLE);
+  });
+
+  test("a manually bound Ctrl+Shift+Z still resolves (native redo is only the default)", () => {
+    const { execCommand } = stubEditorGlobals();
+    const textarea = makeTextarea("E=mc^2", 0, 6);
+    const dependencies = makeDependencies({
+      bindings: { ...DEFAULT_MARKDOWN_SHORTCUTS, blockMath: "Ctrl+Shift+Z" },
+    });
+    const handler = createMarkdownShortcutHandler({
+      getTextarea: () => textarea,
+      getDependencies: () => dependencies,
+    });
+
+    handler(makeEvent(textarea, { key: "Z", code: "KeyZ", shiftKey: true }).event);
+
+    expect(execCommand).toHaveBeenCalledWith("insertText", false, "$$\nE=mc^2\n$$");
+  });
+
+  test("IME composition blocks the new shortcuts too", () => {
+    const { execCommand } = stubEditorGlobals();
+    const textarea = makeTextarea("ni", 0, 2);
+    const dependencies = makeDependencies();
+    const handler = createMarkdownShortcutHandler({
+      getTextarea: () => textarea,
+      getDependencies: () => dependencies,
+    });
+    const { event, preventDefault } = makeEvent(textarea, {
+      key: "B",
+      code: "KeyB",
+      shiftKey: true,
+      isComposing: true,
+    });
+
+    handler(event);
+
+    expect(preventDefault).not.toHaveBeenCalled();
+    expect(execCommand).not.toHaveBeenCalled();
   });
 
   test("reports the applied edit so the undo guard can bound itself", () => {

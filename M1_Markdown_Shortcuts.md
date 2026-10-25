@@ -1,7 +1,19 @@
 # M1 Markdown Shortcuts
 
+> **STATUS: CLOSED**
+>
+> | 阶段                            | 状态             |
+> | ------------------------------- | ---------------- |
+> | M1 Markdown Shortcuts           | **CLOSURE PASS** |
+> | M1.1 Extended Markdown Commands | **CLOSURE PASS** |
+> | 人工验收                        | **PASS**         |
+>
+> 收口记录见 §14；提交为 `feat(editor): complete markdown editing shortcuts`。
+> Live Preview（M0 原型）已完整回退，**不属于本次提交**，
+> 技术结论单独留在 `LIVE_PREVIEW_M0.md`（`PROTOTYPE VALIDATED / DEFERRED`）。
+>
 > 阶段范围：仅 Markdown 编辑快捷键。
-> 不涉及 M2 Storage、不修改 notes 存储、不动 updater、未做无关重构、未执行 Git commit。
+> 不涉及 M2 Storage、不修改 notes 存储、不动 updater、未做无关重构。
 >
 > **R2 已修订本文件的 §4 / §5 / §9**：
 >
@@ -18,9 +30,10 @@ MainWindow 与 NotePad 各自通过 `useMarkdownShortcuts()` 在本 WebView 内�
 未使用 Rust global shortcut。
 
 R1 的 PASS 在人工验收中被推翻（undo 后 textarea 全选），R2 修复并重测，
-最终结论见 §12.7。
+最终结论见 §12.7；M1.1 在其上扩展 5 个 command，结论见 §13；两者合并收口见 §14。
 
-**M1 R2: READY FOR MANUAL CLOSURE**
+**M1: CLOSURE PASS**
+**M1.1: CLOSURE PASS**
 
 ## 2. 修改文件
 
@@ -48,44 +61,50 @@ R1 的 PASS 在人工验收中被推翻（undo 后 textarea 全选），R2 修�
 ## 3. Command 架构
 
 ```
-Toolbar 按钮 (MainWindow.tsx:2781)
+Toolbar 按钮 (MainWindow.tsx)
         │
         └──────────────┐
                        ▼
-            applyMarkdownCommand(textarea, command, t, setContent, markDirty)
+            applyMarkdownCommand(textarea, command, setContent, markDirty)
                        ▲
         ┌──────────────┘
-document keydown (useMarkdownShortcuts.ts:88)
-        │  resolveMarkdownShortcut(event)  → MarkdownCommand | null   (shortcuts.ts:42)
+document keydown (useMarkdownShortcuts.ts)
+        │  resolveMarkdownShortcut(event, bindings) → MarkdownCommand | null
         ▼
-computeMarkdownEdit(value, start, end, command, translate)           (commands.ts:57)
+computeMarkdownEdit(value, start, end, command)                      (commands.ts)
         ▼
-{ result, cursorStart, cursorEnd } | null（null = no-op）
+{ result, replaceStart, replaceEnd, replacement, cursorStart, cursorEnd } | null
         ▼
-setSelectionRange(0, len) → execCommand("insertText", false, result)  (commands.ts:274)
+setSelectionRange(replaceStart, replaceEnd) → execCommand("insertText", false, replacement)
 ```
 
 三层职责与文件一一对应：
 
-- `commands.ts`：`MarkdownAction`（无参数 command，也就是 Toolbar 的 10 个按钮）+ `SetHeadingCommand`（`{ type: "setHeading", level }`）。`computeMarkdownEdit()` 是纯函数（无 DOM），`applyMarkdownCommand()` 只负责落盘式应用。返回 `false` 表示 no-op，此时 DOM、`setContent`、`markDirty` 都不会被触碰。
+- `commands.ts`：`MarkdownAction`（无参数 command，也就是 Toolbar 的按钮）+ `SetHeadingCommand`（`{ type: "setHeading", level }`）。`computeMarkdownEdit()` 是纯函数（无 DOM），`applyMarkdownCommand()` 只负责应用。返回 `null` 表示 no-op，此时 DOM、`setContent`、`markDirty` 都不会被触碰。
 - `shortcuts.ts`：只有映射，不读 textarea、不调 `preventDefault`，可直接用普通对象测试。
 - `useMarkdownShortcuts.ts`：`createMarkdownShortcutHandler()` 与 React 解耦（可测），`useMarkdownShortcuts()` 只做一次 `document.addEventListener("keydown")`，用 ref 持有最新回调，避免每次输入重绑。
 
-Toolbar 的 `heading` 循环行为逐字保留（`commands.ts:127-154`），新增的 `setHeading` 是独立分支（`commands.ts:79-99`），两者互不影响。
+Toolbar 的 `heading` 循环行为逐字保留，`setHeading` 是独立分支，两者互不影响。
+command 层不产生任何示例文本，因此也不再依赖 i18n（`translate` 参数已于 M1.1 收口时移除）。
 
 ## 4. Shortcut mapping
 
-> R2 起这张表只是**默认值**，实际生效的绑定来自 Settings（§12.2）。
-> 下表的按键仍可通过设置面板改写，`Ctrl+Z/Y/S/A/C/V/X` 属保留组合，不允许绑定。
+> R2 起这张表只是**默认值**，实际生效的绑定来自 Settings（§12.2）；
+> M1.1 新增 7 个 action，**最终默认表以 §13.6 为准**，下表与之一致。
 
-| 按键                | Command                         | 说明                                                                   |
-| ------------------- | ------------------------------- | ---------------------------------------------------------------------- |
-| `Ctrl+B`            | `bold`                          | 有选区包裹选区；无选区插入本地化示例文本                               |
-| `Ctrl+I`            | `italic`                        | 同上                                                                   |
-| `Ctrl+K`            | `link`                          | `[文本](url)`，生成后**选中 `url` 占位符**，直接输入/粘贴即可替换      |
-| `Ctrl+1` … `Ctrl+6` | `{ type: "setHeading", level }` | 精确设置，已是同级则 **no-op**                                         |
-| `Ctrl+Shift+7`      | `ol`                            | 数字键优先用 `event.code === "Digit7"` 判定，避免布局相关 `key`（`&`） |
-| `Ctrl+Shift+8`      | `ul`                            | 同上（`Digit8` / `*`）                                                 |
+| 按键                | Command                         | 说明                                                                    |
+| ------------------- | ------------------------------- | ----------------------------------------------------------------------- |
+| `Ctrl+B`            | `bold`                          | 有选区包裹选区；无选区插入本地化示例文本                                |
+| `Ctrl+I`            | `italic`                        | 同上                                                                    |
+| `Ctrl+K`            | `link`                          | `[文本](url)`，生成后**选中 `url` 占位符**，直接输入/粘贴即可替换       |
+| `Ctrl+1` … `Ctrl+6` | `{ type: "setHeading", level }` | 精确设置，已是同级则 **no-op**                                          |
+| `Ctrl+Shift+1`      | `ul`                            | 数字键用 `event.code === "Digit1"` 判定，Shift 后 `key` 变 `!` 也能命中 |
+| `Ctrl+Shift+2`      | `ol`                            | 同上（`Digit2` / `@`）                                                  |
+| `Ctrl+Shift+Q`      | `inlineCode`                    | 行内代码                                                                |
+| `Ctrl+Shift+W`      | `codeBlock`                     | 围栏代码块                                                              |
+| `Ctrl+Shift+A`      | `blockMath`                     | `$$` 块级公式（避开原生 Redo，见 §13.2）                                |
+| `Ctrl+Shift+S`      | `inlineMath`                    | `$…$` 行内公式                                                          |
+| `Ctrl+Shift+B`      | `table`                         | 2×2 GFM 表格，选中 `Header 1`                                           |
 
 其余一律返回 `null`，不 `preventDefault`：
 `Ctrl+Z / Ctrl+Y / Ctrl+S / Ctrl+A / Ctrl+C / Ctrl+V / Ctrl+X / Tab / Escape / 裸字母 / AltGr(Alt+…)`。
@@ -95,7 +114,7 @@ Toolbar 的 `heading` 循环行为逐字保留（`commands.ts:127-154`），新�
 - `Cmd`（`metaKey`）等价于 `Ctrl`，沿用仓库既有 `ctrlKey || metaKey` 约定（`MainWindow.tsx` 的 Ctrl+S 同款）。
 - 非拉丁键盘布局下 `event.key` 不是 `b` 时，回退按物理键 `event.code === "KeyB"` 命中。
 - 小键盘 `Numpad3` 与主键盘 `Digit3` 等价（`Ctrl+3`）。
-- 标题键位只在**无 Shift** 时生效，`Ctrl+Shift+1`（`!`）不会被误判。
+- 标题键位只在**无 Shift** 时生效，所以 `Ctrl+Shift+1` 不会被误判成 H1 —— 它是无序列表。
 
 ## 5. Undo 保持方式
 
@@ -210,7 +229,7 @@ Toolbar 的 `heading` 仍用旧判定，行为与上游逐字一致。
 3. Toolbar `H` 循环对 H6（`###### `）不匹配 `^(#{1,5})\s`，会落到"普通行"分支追加 `## `。上游既有行为，未动。
 4. Link 的 `url` 占位符不做本地化（三语言都是 `url`），因为它是占位内容而非文案，且生成后立刻被选中。
 5. 快捷键只在目标 textarea 聚焦时生效：NotePad 标题输入框、Tile 磁贴视图、Preview 模式（textarea 未挂载）都不响应。
-6. 未纳入本阶段的 Typora 组合：`Ctrl+Shift+B`（引用）、`Ctrl+Shift+\``（行内代码）、`Ctrl+Shift+K`（删除线）。
+6. 未纳入本阶段的 Typora 组合：`Ctrl+Shift+B`（引用，该键 M1.1 已用作表格）、`Ctrl+Shift+\``（行内代码，已由 `Ctrl+Shift+Q` 覆盖）、`Ctrl+Shift+K`（删除线）。
 7. 若输入法在 composition **之外**注册并吞掉 `Ctrl+B` 这类组合（少见），应用仍会接管；IME 保护只覆盖组合态。
 8. 未安装 jsdom / testing-library，因此"真实 DOM 回放 Ctrl+Z"与"真实 IME 组合"没有自动化用例，靠结构断言 + 人工验收。
 
@@ -218,7 +237,7 @@ Toolbar 的 `heading` 仍用旧判定，行为与上游逐字一致。
 
 1. MainWindow：选中文本 `Ctrl+B` → 加粗；`Ctrl+Z` 一次撤销回原状（不是退两次，也不是整篇回滚）。
 2. MainWindow：光标在 `## 标题` 行按 `Ctrl+2` → 无变化（no-op）；按 `Ctrl+4` → 变成 `#### 标题`；Toolbar `H` 仍是循环升级。
-3. MainWindow：`Ctrl+Shift+8` 多行选区 → 每行加 `- `。
+3. MainWindow：`Ctrl+Shift+1` 多行选区 → 每行加 `- `（M1.1 前是 `Ctrl+Shift+8`）。
 4. NotePad：同一组快捷键生效；焦点在**标题输入框**时按 `Ctrl+B` 不受影响。
 5. 中文输入法：拼音候选框展开期间按 `Ctrl+B`，只应影响候选框，不产生 `**`。
 6. Split / Preview 模式切换后，快捷键只在 Edit 侧 textarea 生效。
@@ -319,12 +338,12 @@ document.execCommand("insertText", false, replacement); // 仍然只有一次 �
 
 #### 12.2.1 绑定模型（`src/features/markdown/shortcutBindings.ts`）
 
-绑定 = 一个可序列化字符串（`Ctrl+B` / `Ctrl+Shift+7`），同时用于持久化、显示与匹配。
+绑定 = 一个可序列化字符串（`Ctrl+B` / `Ctrl+Shift+1`），同时用于持久化、显示与匹配。
 
 | 能力          | 函数                                                | 规则                                                                                                                      |
 | ------------- | --------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
 | 解析 / 归一化 | `parseMarkdownBinding` / `normalizeMarkdownBinding` | 修饰键大小写不敏感；字母统一大写；`Ctrl/Control`、`Meta/Command/Cmd` 同义                                                 |
-| 显示          | `formatMarkdownBinding`                             | `Ctrl + Shift + 7`                                                                                                        |
+| 显示          | `formatMarkdownBinding`                             | `Ctrl + Shift + 1`                                                                                                        |
 | 捕获          | `bindingFromShortcutEvent`                          | 字母/数字走 `event.code`（布局无关），符号走 `event.key`；返回 ok / modifierOnly / needsModifier / reserved / unsupported |
 | 冲突          | `findShortcutConflict`                              | 同一条绑定被两个 action 占用                                                                                              |
 | 合并          | `resolveMarkdownShortcutBindings`                   | 默认表 + 合法覆盖；非法/保留/重复的覆盖回落默认，永远输出一套可用且无冲突的绑定                                           |
@@ -337,8 +356,14 @@ document.execCommand("insertText", false, replacement); // 仍然只有一次 �
 ```
 bold Ctrl+B    italic Ctrl+I    link Ctrl+K
 heading1..6 Ctrl+1..6
-ol Ctrl+Shift+7    ul Ctrl+Shift+8
+ul Ctrl+Shift+1    ol Ctrl+Shift+2
+inlineCode Ctrl+Shift+Q    codeBlock Ctrl+Shift+W
+blockMath Ctrl+Shift+A     inlineMath Ctrl+Shift+S
+table Ctrl+Shift+B
 ```
+
+（M1.1 首次实现时为 `ol/ul = Ctrl+Shift+7/8`、`inlineCode/codeBlock = Ctrl+Shift+V/C`、
+`inlineMath = Ctrl+Shift+X`、`blockMath = Ctrl+Shift+M`，最终调整见 §13.10。）
 
 #### 12.2.2 Settings UI（`src/features/settings/MarkdownShortcutsSection.tsx`）
 
@@ -466,5 +491,327 @@ R2-A 在不引入 JS undo history 的前提下消除了全选副作用；
 R2-B 把映射表改为配置驱动并接进既有 Settings 架构，MainWindow 与 NotePad 共用同一份绑定。
 
 未完成但已明确归属人工闭环的三项：`tauri build` 后的重启持久化、双窗口实机验证、录制器 UI 交互。
+这三项在收口时**未被单独复述**，因此不记为独立 PASS，状态见 §14.2。
 
-M1 R2: READY FOR MANUAL CLOSURE
+**M1 R2: CLOSURE PASS**
+
+---
+
+## 13. M1.1：扩展 Markdown 快捷键
+
+> 范围：在既有 command 层与配置驱动绑定层上新增 5 个 action。
+> 不进 M2 Storage、不改 Rust、不重构、未 commit。
+
+### 13.1 结论
+
+5 个新 action 全部走**同一个** `applyMarkdownCommand()`，没有第二套字符串拼接；
+绑定表新增 5 个 id，自动出现在 Settings → Markdown Shortcuts，
+MainWindow 与 NotePad 因为都经 `useMarkdownShortcutBindings()` 取表（`MainWindow.tsx:1428`、
+`NotePad.tsx:442`）而自动同时生效 —— 新增 action 时这两个组件无需改动
+（最终收口时各删掉一行 `translate: t`，原因见 13.11）。
+
+### 13.2 `Ctrl+Shift+Z` 让给原生 Redo
+
+最终默认表（13.6）完全采用指定组合，其中不含 `Ctrl+Shift+Z`。这条证据仍值得保留：
+它既解释了为什么该组合不进默认表，也说明了用户手动绑上去之后会发生什么。
+
+| 证据                   | 内容                                                                                                                    |
+| ---------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| Chromium/WebView2 行为 | Windows 下可编辑区域内 `Ctrl+Shift+Z` 是**原生重做**（`Ctrl+Y` 之外的第二个绑定）                                       |
+| Floral 自身文案        | 重做按钮 tooltip 写死"重做（Ctrl+Y）"（`MainWindow.tsx:2611`），说明上游只承诺 `Ctrl+Y`                                 |
+| Floral 菜单            | 全仓库无任何 accelerator，Windows 侧 `MenuItem::with_id(..., None::<&str>)` 最后一个参数全是 `None`（`desktop.rs:735`） |
+| `preventDefault` 后果  | 我们的 handler 一旦命中就 `preventDefault()`，会**吞掉**原生 redo —— 用户按 `Ctrl+Shift+Z` 得到的是插入公式，不是重做   |
+
+因此：
+
+- `Ctrl+Shift+Z` **不是默认值**，但**仍可手动绑定**（见 13.4）。用户绑上去等于自愿放弃这一条 redo，
+  `Ctrl+Y` 与 Toolbar 重做按钮始终不受影响。
+- `Ctrl+Shift+A / S / Q / W / B` 在可编辑区域没有浏览器默认行为，不会与 Undo/Redo 竞争：
+  Chromium 的"另存为"是 `Ctrl+S`、剪贴板是 `Ctrl+C/V/X`，加上 Shift 都是另一个组合。
+  `Ctrl+Shift+A` / `Ctrl+Shift+W` 在 Chrome 浏览器里分别对应"标签页搜索"和"关闭窗口"，
+  但那是**浏览器 UI 层**功能，WebView2 没有标签栏，Tauri 宿主也不注册这两个 accelerator；
+  这一点仍列入 13.9 的人工抽检，因为 WebView2 的 browser accelerator 集合取决于运行时版本。
+
+### 13.3 修改文件
+
+| 文件                                                                                                   | 变化                                                                                                                    |
+| ------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------- |
+| `src/features/markdown/commands.ts`                                                                    | 68 行变更：`MarkdownAction` 增 `inlineCode` / `codeBlock` / `table`；新增 `blockPadding()`；改写 `blockMath` 的换行策略 |
+| `src/features/markdown/shortcutBindings.ts`                                                            | 42 行变更：5 个新 id + 默认键；`isReservedMarkdownBinding` 放宽 Shift/Alt 变体；`commandForShortcutId` 补分支           |
+| `src/features/settings/MarkdownShortcutsSection.tsx`                                                   | 10 行变更：5 个标签键与回退文案（`satisfies Record<MarkdownShortcutId, string>` 逼着补齐）                              |
+| `src/locales/{zh-CN,en-US,zh-HK}/translation.json`                                                     | 各 +5 行：`settings.markdownShortcuts.action.*`                                                                         |
+| `commands.test.ts` / `shortcutBindings.test.ts` / `shortcuts.test.ts` / `useMarkdownShortcuts.test.ts` | 共 +378 行：语义、最小区间、默认映射、冲突、IME、handler 全链路                                                         |
+| `MarkdownPreview.test.tsx`                                                                             | +37 行：用 command 的真实输出喂渲染器，断言表格与 KaTeX                                                                 |
+
+`shortcuts.ts`、`useMarkdownShortcuts.ts`、`MainWindow.tsx`、`NotePad.tsx`、`useMarkdownShortcutBindings.ts`
+**未改动** —— 映射层本来就是遍历 `MARKDOWN_SHORTCUT_IDS`，加 id 即生效。
+
+### 13.4 保留键修正
+
+原判定是"只要 base key 在 `z/y/a/c/v/x/s` 里就拒绝"，于是 `Ctrl+Shift+V` 会被误拒。
+现在只在**没有 Shift、没有 Alt** 时才算基础组合（`shortcutBindings.ts:173`）：
+
+```ts
+if (!parsed.ctrl && !parsed.meta) return true; // 必须带主修饰键
+if (parsed.shift || parsed.alt) return false; // 带 Shift/Alt 就是另一个组合
+return RESERVED_SHORTCUT_KEYS.includes(parsed.key);
+```
+
+于是 `Ctrl+Z / Y / A / C / V / X / S` 依然拒绝，
+而 `Ctrl+Shift+A / S / Q / W / B / Z`、`Ctrl+Alt+V` 全部放行 ——
+默认表里的 `Ctrl+Shift+A`（块级公式）与 `Ctrl+Shift+S`（行内公式）正依赖这条规则。
+
+同步更新的两处旧断言（它们写死了"`Ctrl+Shift+B` 无冲突"，而该键现在是表格的默认值）：
+`findShortcutConflict` 用例改为断言返回 `"table"`；`resolveMarkdownShortcutBindings` 的
+"valid overrides" 用例改用 `Ctrl+Alt+B`。
+
+### 13.5 Command 语义
+
+统一原则：**有选区 → 包裹已有内容；无选区 → 只插入最小合法 Markdown 结构，不生成任何示例文本**，
+光标直接落在可输入位置。Toolbar 与快捷键调用同一个 command，因此两者行为完全一致。
+
+| Command                | 有选区               | 无选区                               | 执行后 caret / selection            |
+| ---------------------- | -------------------- | ------------------------------------ | ----------------------------------- |
+| Bold                   | `**hello**`          | `****`                               | 选中原文 / caret 落在两对 `*` 之间  |
+| Italic                 | `*hi*`               | `**`                                 | 同上                                |
+| Link                   | `[hi](url)`          | `[]()`                               | 选中 `url` / caret 落在 `[]` 内     |
+| Inline Code            | `` `hello` ``        | &#96;&#96;（两个反引号）             | 选中原文 / caret 落在反引号之间     |
+| Inline Math            | `$E=mc^2$`           | `$$`                                 | 选中公式 / caret 落在两个 `$` 之间  |
+| Code Block             | ` ```\nhello\n``` `  | ` ```\n\n``` `                       | 选中代码正文 / caret 落在空行行首   |
+| Block Math             | `$$\nE=mc^2\n$$`     | `$$\n\n$$`                           | 选中公式 / caret 落在空行行首       |
+| Table                  | 不区分（空 2×2 GFM） | `\|  \|  \|` + 分隔行 + `\|  \|  \|` | caret 落在第一个表头单元格          |
+| Heading（Toolbar `H`） | `## 选区文本`        | `## `                                | caret 落在记号之后                  |
+| H1–H6（`setHeading`）  | 只改行首记号         | 插入 `# ` … `###### `                | caret 跟随记号平移                  |
+| UL / OL                | 逐行加 `- ` / `n. `  | `- ` / `1. `                         | 选中生成的列表 / caret 落在记号之后 |
+| Quote                  | 逐行加 `> `          | `> `                                 | 同上                                |
+| Code（Toolbar 自适应） | 单行→行内，跨行→围栏 | &#96;&#96;                           | 同上                                |
+| HR                     | —                    | `---`                                | caret 落在 `---` 之后               |
+
+补充说明：
+
+- **块级语法的换行**由 `blockPadding()`（`commands.ts`）处理：只有当 `$$` / ` ``` ` / 表格
+  会被"粘"在上一行或下一行正文上时才补一个换行。整行选中时结果就是 `$$\nE=mc^2\n$$`，
+  不会有前后多余空行。
+- 空块不会让预览报错：`MarkdownPreview` 对 `$$\n\n$$` 与 ` ```\n\n``` ` 都有自动化用例
+  （见 13.7），空表格也能渲染成带 2 个 `<th>` 的真表格 —— 这是"插入即看到结构"的前提。
+- `inlineCode` / `codeBlock` 与 Toolbar 既有的 `code` action 并存：`code` 仍按"单行→行内、
+  跨行→围栏"自适应；`inlineCode` / `codeBlock` 语义固定，供快捷键使用。
+- 移除示例文本后，`main.formatSample.*` 这 7 个 locale 键已无引用。本次**保留**它们
+  （删除属于独立清理，不影响行为），后续里程碑可一并移除。
+
+### 13.6 默认键
+
+| Action      | 默认键              | 备注                                                  |
+| ----------- | ------------------- | ----------------------------------------------------- |
+| 无序列表    | `Ctrl+Shift+1`      | 数字键走 `event.code`，Shift 后 `key` 变 `!` 也能命中 |
+| 有序列表    | `Ctrl+Shift+2`      | 同上                                                  |
+| 行内代码    | `Ctrl+Shift+Q`      |                                                       |
+| 代码块      | `Ctrl+Shift+W`      |                                                       |
+| 块级公式    | `Ctrl+Shift+A`      | 不用 `Ctrl+Shift+Z`，理由见 13.2                      |
+| 行内公式    | `Ctrl+Shift+S`      | 与 `Ctrl+S`（保存）是两个组合，保留键判定已区分       |
+| 表格        | `Ctrl+Shift+B`      |                                                       |
+| 粗体 / 斜体 | `Ctrl+B` / `Ctrl+I` | R1 既有，未改                                         |
+| 链接        | `Ctrl+K`            | R1 既有，未改                                         |
+| H1–H6       | `Ctrl+1`–`Ctrl+6`   | exact heading，同级再按为 no-op                       |
+
+全部可改、有冲突检测、支持单项 `↺` 与"全部恢复默认"（复用 R2 的同一套 UI 与逻辑，无新增分支）。
+Settings 面板的显示顺序由 `MARKDOWN_SHORTCUT_IDS`（`shortcutBindings.ts:32`）决定，
+已调整为与上表一致（无序列表在有序列表之前）；显示文案由 `formatMarkdownBinding()` 从当前绑定
+实时生成，没有任何硬编码键名。
+
+### 13.7 测试与构建结果
+
+| 项目                             | 结果                                                               |
+| -------------------------------- | ------------------------------------------------------------------ |
+| `npx tsc --noEmit`               | PASS                                                               |
+| `npx vitest run`                 | **28 文件 / 263 用例全过**（R2 为 200，M1.1 首轮 241，收口后 263） |
+| ├ `commands.test.ts`             | 66（含"任何 command 都不残留 CJK 占位符"的参数化用例）             |
+| ├ `shortcutBindings.test.ts`     | 36（默认值、Settings 显示、唯一性、保留键放宽、扩展冲突）          |
+| ├ `shortcuts.test.ts`            | 29（7 个默认映射、旧键失效、Ctrl+Shift+Z 留空、重绑定释放旧键）    |
+| ├ `useMarkdownShortcuts.test.ts` | 16（新命令全链路、手动绑 Ctrl+Shift+Z、IME）                       |
+| └ `MarkdownPreview.test.tsx`     | 8（直接用 command 产物喂渲染器：空表格、空围栏、空公式块）         |
+| `npx oxlint src`                 | 87 文件 0 warning / 0 error                                        |
+| `npx oxfmt --check`              | clean                                                              |
+| `npx vite build`                 | PASS（955ms，`index-*.js` 234 kB、`MarkdownPreview-*.js` 331 kB）  |
+
+`npm run build` 原地构建仍会清空 `dist/assets`（沙箱批量删除确认），沿用 R2 的做法构建到临时 outDir，
+产物同源；仓库 `dist/` 未被动过。
+
+覆盖到的验证项：inline math 有/无选区、block math 有/无选区（含行中光标、段落之间）、
+inline code 有/无选区（含跨行仍保持行内）、code block 有/无选区、空表格插入与首个单元格 caret、
+所有 command 无选区时不产出任何文字（含 CJK 占位符检查）、每项的最小编辑区间、
+`applyMarkdownCommand` 单次 `insertText`、默认映射、自定义绑定、
+重复冲突、Reset / Reset All（逻辑层与 R2 同一实现）、双窗口共用同一绑定源、IME、locale 键齐平。
+
+### 13.8 已知限制
+
+1. **`Ctrl+Shift+Z` 的取舍是产品决定**：不进默认表（块级公式用 `Ctrl+Shift+A`），但允许用户绑；
+   一旦绑定，该组合下不再触发原生 redo（`Ctrl+Y` 与 Toolbar 重做按钮不受影响）。
+2. 表格插入不接受选区内容做转换（第一版明确不做），选区会被替换掉。
+3. 行内公式不处理跨行选区：`$a\nb$` 在 CommonMark 行内语义下不会渲染成公式，
+   要写多行公式请用块级。
+4. `codeBlock` / `blockMath` 无选区时插入的空块在预览里没有可见内容（只有标记本身），
+   这是"用户还没输入"的中间状态，不是渲染缺陷；`codeBlock` 也没有语言标记选择器（第一版不做）。
+5. 空表格的表头单元格不含任何文字，列名需要用户自己输入；第一版不做 Table Editor。
+6. `Ctrl+Shift+1 / 2` 依赖 `event.code`（`Digit1` / `Digit2`）。当前 WebView2 完整上报 `code`；
+   若某个极端环境不报 `code`，会退化为 `event.key`，而 Shift+1 的 `key` 是 `!`，该组合将不命中。
+   `Ctrl+Shift+Q/W/A/S/B` 不依赖这一点（字母键无论如何都能从 `key` 还原）。
+7. `main.formatSample.*`（7 个键 × 3 语言）已无引用，本次保留未删，避免扩大改动面。
+
+### 13.9 人工验收清单（M1.1）
+
+1. 选中 `E=mc^2` 按 `Ctrl+Shift+S` → 预览出现行内公式；再按 `Ctrl+Z` 一次回到原文，无全文全选。
+2. 整行选中 `E=mc^2` 按 `Ctrl+Shift+A` → 得到 `$$\nE=mc^2\n$$`，预览为居中公式块。
+3. 无选区按 `Ctrl+Shift+A` → 得到空块 `$$\n\n$$`，光标在中间那行，直接输入公式即可。
+4. 选中 `hello` 按 `Ctrl+Shift+Q` → `` `hello` ``；按 `Ctrl+Shift+W` → 围栏代码块。
+5. 无选区按 `Ctrl+Shift+B` → 插入空 2×2 表格，光标在第一个表头单元格内，预览已是真表格。
+6. 任意行按 `Ctrl+Shift+1` → 无序列表；`Ctrl+Shift+2` → 有序列表。
+   6b. **无选区**按 `Ctrl+B` → `****` 且光标在两对星号中间，直接打字即为粗体；
+   `Ctrl+I` → `**`；`Ctrl+Shift+Q` → 一对反引号；`Ctrl+Shift+S` → `$$`；`Ctrl+K` → `[]()`。
+7. 设置面板出现 7 行新增项，可录制、可单项恢复、可全部恢复；改完两窗口同时生效。
+8. 按 `Ctrl+Shift+Z` 应仍是**重做**（未被默认占用）；`Ctrl+Y` 重做正常。
+9. 按 `Ctrl+Shift+A` / `Ctrl+Shift+S` 不应触发浏览器级动作（标签页搜索 / 另存为）。
+10. 中文输入法候选框展开时按任一新增组合 → 不插入任何标记。
+
+### 13.10 默认键最终调整
+
+按最终确认的表替换了 7 个默认组合。**只动默认值与测试，command 层、绑定模型、hook、
+两个窗口组件、Rust 侧全部零改动**：
+
+| 文件                           | 变化                                                                        |
+| ------------------------------ | --------------------------------------------------------------------------- |
+| `shortcutBindings.ts`          | 默认表 7 项；`MARKDOWN_SHORTCUT_IDS` 中 `ul` 提到 `ol` 前（对齐展示顺序）   |
+| `shortcutBindings.test.ts`     | 默认值断言、Settings 显示断言、冲突断言改为新键；Digit1 捕获用例            |
+| `shortcuts.test.ts`            | 默认映射改用新键；新增「旧键 `Ctrl+Shift+7/8` 已失效」；重绑定用例改 Digit1 |
+| `useMarkdownShortcuts.test.ts` | 全链路用例的内联代码按键由 `Ctrl+Shift+V` 改为 `Ctrl+Shift+Q`               |
+| `M1_Markdown_Shortcuts.md`     | 本节与 13.2 / 13.4 / 13.6 / 13.7 / 13.8 / 13.9                              |
+
+兼容性说明：`config.json` 的 `markdownShortcuts` 只在用户**主动改绑**时写入对应项，
+默认值从不落盘。所以没改过快捷键的用户升级后直接得到新默认；
+改过某项的用户保留自己的选择（`resolveMarkdownShortcutBindings` 以覆盖优先），
+这正是 R2 设计的预期行为。
+
+验证：`tsc` PASS、`vitest` **28 文件 / 243 用例全过**、`oxlint` 0/0、`oxfmt --check` clean、
+`vite build` 到临时目录 PASS（1.17s）。未执行 Git commit。
+
+### 13.11 无选区行为收口：不再生成任何示例文本
+
+旧行为会在无选区时插入「粗体文本」「列表项」「链接文本」「代码」「标题」以及
+`Header 1 / Cell 1` 这类占位内容。问题在于它们**是真实写入正文的字符**：
+用户想写 `**foo**` 得先把「粗体文本」删掉，想填表格得逐个删掉 Header/Cell。
+
+现在统一为：**只插入最小合法 Markdown 结构，光标落在可输入位置**。
+
+| Command                | 旧（无选区）                                           | 新（无选区）                          |
+| ---------------------- | ------------------------------------------------------ | ------------------------------------- |
+| Bold                   | `**粗体文本**`（选中文本）                             | `****`，caret 在中间                  |
+| Italic                 | `*斜体文本*`                                           | `**`，caret 在中间                    |
+| Link                   | `[链接文本](url)`（选中 url）                          | `[]()`，caret 在 `[]` 内              |
+| Inline Code            | `` `代码` ``                                           | &#96;&#96;，caret 在中间              |
+| Inline Math            | `$E=mc^2$`（选中公式）                                 | `$$`，caret 在中间                    |
+| Code Block             | 已是空块（不变）                                       | ` ```\n\n``` `                        |
+| Block Math             | `$$\nx^2+y^2=r^2\n$$`                                  | `$$\n\n$$`                            |
+| Table                  | `Header 1 / Header 2 / Cell …`                         | `\|  \|  \|` + 分隔行 + `\|  \|  \|`  |
+| Heading（Toolbar `H`） | `## 标题`（选中"标题"）                                | `## `                                 |
+| UL / OL / Quote / Code | `- 列表项` / `1. 列表项` / `> 引用文本` / `` `代码` `` | 只有 `- ` / `1. ` / `> ` / &#96;&#96; |
+
+#### 13.11.1 Toolbar 与快捷键的一致性
+
+Toolbar 的 10 个按钮与快捷键**本来就调用同一个** `applyMarkdownCommand()`
+（`MainWindow.tsx` 的 `toolbarButtons.map`），所以上表对两者同时生效，
+不存在"快捷键是新行为、Toolbar 还是旧行为"的分叉。`hr` 没有示例文本，未受影响。
+
+#### 13.11.2 顺带移除的 `translate` 参数
+
+`computeMarkdownEdit()` / `applyMarkdownCommand()` / `useMarkdownShortcuts()`
+原有一个 `translate: TFunction` 参数，唯一用途就是取那几句示例文本。
+示例文本移除后它变成纯死参数，而 `tsconfig` 开着 `noUnusedParameters`，
+留着会直接编译失败。因此一并删除，调用点同步更新：
+
+- `src/features/markdown/commands.ts`：两个函数的签名
+- `src/features/markdown/useMarkdownShortcuts.ts`：`MarkdownShortcutDependencies` 与
+  `UseMarkdownShortcutsOptions` 去掉 `translate`，`dependenciesRef` 同步收窄
+- `src/components/MainWindow.tsx`：Toolbar 调用与 hook 选项各去掉一个实参
+- `src/components/NotePad.tsx`：hook 选项去掉一个实参
+
+这是**删除失效参数**，不是新建抽象；`t` 在两个组件里仍有其它用途，未受影响。
+
+#### 13.11.3 验证
+
+| 项目                | 结果                                                                                       |
+| ------------------- | ------------------------------------------------------------------------------------------ |
+| `tsc --noEmit`      | PASS（`noUnusedParameters` 全绿）                                                          |
+| `vitest`            | **28 文件 / 263 用例全过**（+20：command 无选区语义重写、空表格/空块渲染、CJK 占位符检查） |
+| 空表格渲染          | `\|  \|  \|` + `\| --- \| --- \|` 被 remark-gfm 识别为真表格，产出 2 个 `<th>`             |
+| 空围栏 / 空公式块   | 均能渲染且不抛错（`<pre>` / 可选中容器）                                                   |
+| `oxlint src`        | 87 文件 0/0                                                                                |
+| `oxfmt --check src` | clean                                                                                      |
+| `vite build`        | PASS（955ms）                                                                              |
+
+新增的关键用例：
+
+- `no command invents sample content`：对 13 个 command 逐一断言无选区产物**不含任何中日韩字符**，
+  这条会在未来有人重新加回占位文本时立刻失败。
+- `the table carries no sample cells at all`：断言不含 `Header` / `Cell`。
+- `the caret lands inside the first header cell`：断言 caret 位置使前缀恰为 `| `。
+- 渲染层三条：空表格 2 个 `<th>`、空围栏 `<pre>`、空公式块不崩。
+
+**M1.1: CLOSURE PASS**
+
+---
+
+## 14. Final Closure（M1 / M1.1 合并收口）
+
+### 14.1 收口前置检查
+
+| 检查项                                   | 结果                                                           |
+| ---------------------------------------- | -------------------------------------------------------------- |
+| `src/features/livePreview/`              | 不存在（已整体回退）                                           |
+| 源码中 `livePreview` / `CodeMirror` 引用 | 0 处（`grep -rln` 为空）                                       |
+| `package.json` / `package-lock.json`     | 无 `@codemirror/*`、无 `@lezer/*`，两者相对 HEAD 均无差异      |
+| `ViewMode`                               | `"edit" \| "split" \| "preview"`，无 `"live"`                  |
+| 顶部模式组                               | `编辑 \| 分栏 \| 预览`                                         |
+| 构建产物入库                             | 无：`dist/`、`src-tauri/target/`、`node_modules/` 均未 tracked |
+
+### 14.2 人工验收（已完成）
+
+用户在应用中实际使用后确认通过，明确覆盖以下四项：
+
+| 验收项                                                     | 结果 |
+| ---------------------------------------------------------- | ---- |
+| 13 个 command 的快捷键触发                                 | PASS |
+| 无选区时只产出最小 Markdown 结构，不生成任何示例文本       | PASS |
+| Undo / Redo 后选区不再出现整篇全选                         | PASS |
+| Settings → Markdown Shortcuts 自定义绑定（含冲突与 Reset） | PASS |
+
+以下三项在 §12.6 / §13.9 清单中曾列为待闭环，收口时**未被单独复述**，
+故不记为独立 PASS，留作后续实机关注点（代码路径与已验收项相同，无额外分支）：
+
+- `tauri build` 产物重启后绑定持久化；
+- MainWindow / NotePad 双窗口同时打开时各自生效；
+- 中文 IME 组合期按快捷键被抑制（`isComposing` / `keyCode === 229` 守卫，已有单测）。
+
+### 14.3 最终增量验证
+
+| 项目            | 结果                      |
+| --------------- | ------------------------- |
+| `tsc --noEmit`  | PASS                      |
+| `vitest`        | 28 文件 / 263 用例全过    |
+| `oxlint src`    | 87 文件 0 warning 0 error |
+| `oxfmt --check` | clean                     |
+| `vite build`    | PASS                      |
+
+### 14.4 提交
+
+`feat(editor): complete markdown editing shortcuts`
+
+本次提交范围：Markdown command 层、快捷键映射与自定义绑定、Settings 录制 UI、
+三语言文案、撤销选区修复、本报告。
+**不含** Live Preview 任何代码与依赖，不含构建产物。
+
+`LIVE_PREVIEW_M0.md` 作为 `PROTOTYPE VALIDATED / DEFERRED` 技术记录保留在
+工作区（untracked），不属于本次提交。
+
+### 14.5 最终状态
+
+`M1/M1.1 CLOSURE: PASS`

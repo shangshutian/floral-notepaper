@@ -21,9 +21,14 @@ export type MarkdownShortcutId =
   | "heading5"
   | "heading6"
   | "ol"
-  | "ul";
+  | "ul"
+  | "inlineCode"
+  | "codeBlock"
+  | "inlineMath"
+  | "blockMath"
+  | "table";
 
-/** 顺序即设置面板的展示顺序 */
+/** 顺序即设置面板的展示顺序（新增项追加在末尾，避免打乱已有位置） */
 export const MARKDOWN_SHORTCUT_IDS: readonly MarkdownShortcutId[] = [
   "bold",
   "italic",
@@ -34,8 +39,13 @@ export const MARKDOWN_SHORTCUT_IDS: readonly MarkdownShortcutId[] = [
   "heading4",
   "heading5",
   "heading6",
-  "ol",
   "ul",
+  "ol",
+  "inlineCode",
+  "codeBlock",
+  "inlineMath",
+  "blockMath",
+  "table",
 ];
 
 export type MarkdownShortcutBindings = Record<MarkdownShortcutId, string>;
@@ -50,13 +60,26 @@ export const DEFAULT_MARKDOWN_SHORTCUTS: MarkdownShortcutBindings = {
   heading4: "Ctrl+4",
   heading5: "Ctrl+5",
   heading6: "Ctrl+6",
-  ol: "Ctrl+Shift+7",
-  ul: "Ctrl+Shift+8",
+  // 数字键走 event.code（Digit1/Digit2），Shift 后即使 event.key 变成 "!" / "@"
+  // 也能稳定命中，与 Ctrl+1..6 的 heading 判定同一套机制。
+  ul: "Ctrl+Shift+1",
+  ol: "Ctrl+Shift+2",
+  inlineCode: "Ctrl+Shift+Q",
+  codeBlock: "Ctrl+Shift+W",
+  inlineMath: "Ctrl+Shift+S",
+  // Ctrl+Shift+Z 在 Chromium / WebView2 的可编辑区域是原生 Redo（Windows），
+  // 默认值必须让开，否则会破坏「撤销 → 重做」的肌肉记忆；该组合仍可手动绑定。
+  blockMath: "Ctrl+Shift+A",
+  table: "Ctrl+Shift+B",
 };
 
 /**
  * 编辑器 / 应用保留的按键：即使带 Ctrl 也不允许被 Markdown 快捷键占用。
- * Ctrl+Z / Ctrl+Y 是 undo-redo，其余是文本剪贴与保存。
+ * `RESERVED_SHORTCUT_KEYS` 只描述**基础组合**（Ctrl+Z / Ctrl+Y / Ctrl+A / Ctrl+C /
+ * Ctrl+V / Ctrl+X / Ctrl+S）。
+ *
+ * 判断时必须额外要求「没有 Shift、没有 Alt」：`Ctrl+Shift+V` 与 `Ctrl+V` 是两个
+ * 不同组合，前者完全可以交给 Markdown command，不能因为 base key 相同就拒绝。
  */
 export const RESERVED_SHORTCUT_KEYS: readonly string[] = ["z", "y", "a", "c", "v", "x", "s"];
 
@@ -152,6 +175,8 @@ export function isReservedMarkdownBinding(binding: string): boolean {
   const parsed = parseMarkdownBinding(binding);
   if (!parsed) return true;
   if (!parsed.ctrl && !parsed.meta) return true;
+  // 带 Shift / Alt 之后就不再是那个基础组合了，允许绑定
+  if (parsed.shift || parsed.alt) return false;
   return RESERVED_SHORTCUT_KEYS.includes(parsed.key);
 }
 
@@ -301,6 +326,16 @@ export function commandForShortcutId(id: MarkdownShortcutId): MarkdownCommand {
       return "ol";
     case "ul":
       return "ul";
+    case "inlineCode":
+      return "inlineCode";
+    case "codeBlock":
+      return "codeBlock";
+    case "inlineMath":
+      return "inlineMath";
+    case "blockMath":
+      return "blockMath";
+    case "table":
+      return "table";
     default:
       return { type: "setHeading", level: Number(id.slice("heading".length)) as HeadingLevel };
   }

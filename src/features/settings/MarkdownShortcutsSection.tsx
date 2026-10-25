@@ -23,6 +23,11 @@ const LABEL_KEYS = {
   heading6: "settings.markdownShortcuts.action.heading6",
   ol: "settings.markdownShortcuts.action.ol",
   ul: "settings.markdownShortcuts.action.ul",
+  inlineCode: "settings.markdownShortcuts.action.inlineCode",
+  codeBlock: "settings.markdownShortcuts.action.codeBlock",
+  inlineMath: "settings.markdownShortcuts.action.inlineMath",
+  blockMath: "settings.markdownShortcuts.action.blockMath",
+  table: "settings.markdownShortcuts.action.table",
 } as const satisfies Record<MarkdownShortcutId, string>;
 
 const LABEL_FALLBACKS = {
@@ -37,6 +42,11 @@ const LABEL_FALLBACKS = {
   heading6: "标题 6",
   ol: "有序列表",
   ul: "无序列表",
+  inlineCode: "行内代码",
+  codeBlock: "代码块",
+  inlineMath: "行内公式",
+  blockMath: "块级公式",
+  table: "表格",
 } as const satisfies Record<MarkdownShortcutId, string>;
 
 interface MarkdownShortcutsSectionProps {
