@@ -3,8 +3,10 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
-    env, fmt, fs, io,
+    env, fmt, fs,
+    io::{self, Write},
     path::{Component, Path, PathBuf},
+    sync::{Mutex, MutexGuard},
 };
 use uuid::Uuid;
 
@@ -328,6 +330,26 @@ fn data_dir_from_notes_dir(notes_dir: &str) -> PathBuf {
 
 const DATA_DIR_ITEMS: [&str; 4] = ["metadata.json", "notes", "images", "backgrounds"];
 
+/// M2.0：物理文件名改用标题，UUID 只留在 metadata / images 目录里
+const DEFAULT_NOTE_STEM: &str = "未命名";
+const MAX_NOTE_STEM_CHARS: usize = 60;
+const MAX_FILE_NAME_ATTEMPTS: usize = 999;
+
+/// M2.0 R1：串行化 metadata 的「读 → 改 → 写」。
+///
+/// 物理文件的唯一性由 `PathClaim` 的 `create_new` 保证，与这把锁无关；
+/// 这把锁只解决另一类丢数据：两个线程各自读到同一份索引、各自追加一条记录、
+/// 后写的把先写的顶掉，于是「文件都在、索引里只剩一条」。
+/// 只在进程内生效（多窗口共用同一进程），不做跨进程锁。
+static METADATA_WRITE_LOCK: Mutex<()> = Mutex::new(());
+
+fn lock_metadata_writes() -> MutexGuard<'static, ()> {
+    // 持锁线程 panic 时内部状态并未被破坏（只有一个 `()`），忽略中毒继续串行
+    METADATA_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 // 旧版无论 notesDir 指向哪里，metadata.json、images、backgrounds 都固定存放在旧主目录；
 // 数据目录解析到其他位置时必须一并带走，否则笔记内图片引用全部失效、created_at 丢失
 fn migrate_legacy_aux_data(legacy_base_dir: &Path, data_dir: &Path) {
@@ -560,6 +582,51 @@ fn paths_refer_to_same_entry(first: &Path, second: &Path) -> bool {
     }
 }
 
+/// 已经被本进程独占的落盘目标。
+///
+/// 「判定名字没被占用」和「写入该名字」在旧实现里是两个独立动作，中间任何
+/// 别的写者都能把文件塞进来，随后被静默覆盖。这里换成 `create_new` 抢占：
+/// 谁建成功谁独占，失败方顺延到下一个候选名，两个动作合成一个不可分割的步骤。
+///
+/// 复用本篇自己的文件（Windows 上的大小写改名）时没有新建动作，`file` 为
+/// `None`，走正常覆盖，不受影响。
+struct PathClaim {
+    file_name: String,
+    path: PathBuf,
+    /// `create_new` 拿到的独占句柄；`None` 表示目标就是本篇既有的文件
+    file: Option<fs::File>,
+    /// 是否由本 claim 新建了占位文件
+    created: bool,
+    /// 是否已经写入内容。写成功后才允许清理旧文件、修改 metadata
+    filled: bool,
+}
+
+impl PathClaim {
+    fn adopt_own_file(file_name: String, path: PathBuf) -> Self {
+        Self {
+            file_name,
+            path,
+            file: None,
+            created: false,
+            // 既有文件里本来就是本篇正文，不需要再写
+            filled: true,
+        }
+    }
+}
+
+impl Drop for PathClaim {
+    fn drop(&mut self) {
+        // 只清理「自己新建、又没写进内容」的占位文件。
+        // 已写内容的 claim 一律保留：metadata 落盘失败时宁可留一份完整的正文
+        // 让 rebuild 捞回来，也不能删掉用户刚保存的稿子。
+        if self.created && !self.filled {
+            // Windows 上必须先关句柄才能删
+            drop(self.file.take());
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
 fn known_data_migration_candidates() -> Vec<PathBuf> {
     known_data_migration_candidates_for(env::var("HOME").ok(), env::var("USERPROFILE").ok())
 }
@@ -770,16 +837,24 @@ impl NoteStore {
     }
 
     pub fn create_note(&self, request: SaveNoteRequest) -> Result<Note, AppError> {
+        let _guard = lock_metadata_writes();
         self.ensure_storage()?;
         let id = Uuid::new_v4().to_string();
         let now = Utc::now();
-        let file_name = self.file_name_for(&id, &request.title);
         let word_count = count_words(&request.content);
         let category = request.category.clone();
-        let note_path = self.note_path_in_category(&file_name, &category);
-        if let Some(parent) = note_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
+        // 先读索引再抢文件名：同名笔记必须拿到 `标题 (2).md`，不能覆盖。
+        // 索引只是提示，真正的唯一性由 `claim_new_path` 的 `create_new` 保证。
+        let mut metadata_file = self.load_metadata()?;
+        let mut claim = self.claim_new_path(
+            &metadata_file,
+            &id,
+            &note_stem(&request.title),
+            &category,
+            None,
+        )?;
+        self.fill_claim_with_content(&mut claim, &request.content)?;
+        let file_name = claim.file_name.clone();
         let metadata = NoteMetadata {
             id: id.clone(),
             title: request.title,
@@ -791,8 +866,6 @@ impl NoteStore {
             preview: preview(&request.content),
         };
 
-        fs::write(&note_path, &request.content)?;
-        let mut metadata_file = self.load_metadata()?;
         metadata_file.notes.push(metadata.clone());
         self.save_metadata(&metadata_file)?;
 
@@ -809,30 +882,36 @@ impl NoteStore {
     }
 
     pub fn update_note(&self, id: &str, request: SaveNoteRequest) -> Result<Note, AppError> {
+        let _guard = lock_metadata_writes();
         self.ensure_storage()?;
         let mut metadata_file = self.load_metadata()?;
-        let note = metadata_file
+        let index = metadata_file
             .notes
-            .iter_mut()
-            .find(|note| note.id == id)
+            .iter()
+            .position(|note| note.id == id)
             .ok_or_else(|| AppError::note_not_found(id))?;
 
-        let old_file_name = note.file_name.clone();
-        let old_category = note.category.clone();
-        let new_file_name = self.file_name_for(id, &request.title);
+        let old_file_name = metadata_file.notes[index].file_name.clone();
+        let old_category = metadata_file.notes[index].category.clone();
+        let old_path = self.note_path_in_category(&old_file_name, &old_category);
         let new_category = request.category.clone();
         let now = Utc::now();
         let word_count = count_words(&request.content);
 
-        let new_path = self.note_path_in_category(&new_file_name, &new_category);
-        if let Some(parent) = new_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(&new_path, &request.content)?;
-        let old_path = self.note_path_in_category(&old_file_name, &old_category);
-        let replaced_path =
-            (old_file_name != new_file_name || old_category != new_category).then_some(old_path);
+        // 顺序刻意如此：先把新路径原子抢下来并写成功，再改索引，最后才回收旧文件。
+        // 任一环节失败都停在原地——旧文件与旧索引原样保留，用户不会丢稿。
+        let mut claim = self.claim_new_path(
+            &metadata_file,
+            id,
+            &note_stem(&request.title),
+            &new_category,
+            Some(&old_path),
+        )?;
+        self.fill_claim_with_content(&mut claim, &request.content)?;
+        let new_file_name = claim.file_name.clone();
+        let new_path = claim.path.clone();
 
+        let note = &mut metadata_file.notes[index];
         note.title = request.title;
         note.file_name = new_file_name.clone();
         note.category = new_category.clone();
@@ -858,11 +937,7 @@ impl NoteStore {
         // of the stale copy must not turn a successful save into "保存失败".
         // Canonical comparison also prevents a case-only rename on Windows
         // from deleting the newly written file through its old spelling.
-        if let Some(old_path) = replaced_path {
-            if old_path.exists() && !paths_refer_to_same_entry(&old_path, &new_path) {
-                let _ = recycle_path(&old_path);
-            }
-        }
+        self.drop_replaced_file(&old_path, &new_path, true);
         Ok(result)
     }
 
@@ -1043,6 +1118,7 @@ impl NoteStore {
     }
 
     pub fn delete_category(&self, name: &str) -> Result<(), AppError> {
+        let _guard = lock_metadata_writes();
         let notes_dir = self.notes_dir();
         let category_path = notes_dir.join(name);
         let dir_exists = category_path.exists();
@@ -1064,15 +1140,27 @@ impl NoteStore {
 
             // Move all notes in this category to uncategorized (root)
             let mut metadata_file = self.load_metadata()?;
-            for note in &mut metadata_file.notes {
-                if note.category == name {
-                    let old_path = category_path.join(&note.file_name);
-                    let new_path = notes_dir.join(&note.file_name);
-                    if old_path.exists() {
-                        fs::rename(&old_path, &new_path)?;
-                    }
-                    note.category = String::new();
+            for index in 0..metadata_file.notes.len() {
+                if metadata_file.notes[index].category != name {
+                    continue;
                 }
+                let note_id = metadata_file.notes[index].id.clone();
+                let old_file_name = metadata_file.notes[index].file_name.clone();
+                let old_path = category_path.join(&old_file_name);
+                // 根目录可能已有同名笔记：先原子抢下根目录的名字再写内容，
+                // 抢不到就退到 `标题 (2).md`，绝不覆盖
+                let stem = file_stem_of(&old_file_name).to_string();
+                let new_file_name = if old_path.exists() {
+                    let mut claim =
+                        self.claim_new_path(&metadata_file, &note_id, &stem, "", Some(&old_path))?;
+                    self.fill_claim_from_source(&mut claim, &old_path)?;
+                    // 源文件留在分类目录里，最后整个目录一起进回收站
+                    claim.file_name.clone()
+                } else {
+                    self.file_name_for_stem(&metadata_file, &note_id, &stem, "", None)
+                };
+                metadata_file.notes[index].file_name = new_file_name;
+                metadata_file.notes[index].category = String::new();
             }
             self.save_metadata(&metadata_file)?;
 
@@ -1101,31 +1189,44 @@ impl NoteStore {
         id: &str,
         new_category: &str,
     ) -> Result<NoteMetadata, AppError> {
+        let _guard = lock_metadata_writes();
         self.ensure_storage()?;
         let mut metadata_file = self.load_metadata()?;
-        let note = metadata_file
+        let index = metadata_file
             .notes
-            .iter_mut()
-            .find(|note| note.id == id)
+            .iter()
+            .position(|note| note.id == id)
             .ok_or_else(|| AppError::note_not_found(id))?;
 
-        let old_category = note.category.clone();
+        let old_category = metadata_file.notes[index].category.clone();
         if old_category == new_category {
-            return Ok(note.clone());
+            return Ok(metadata_file.notes[index].clone());
         }
 
-        let old_path = self.note_path_in_category(&note.file_name, &old_category);
-        let new_path = self.note_path_in_category(&note.file_name, new_category);
-        if let Some(parent) = new_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        if old_path.exists() {
-            fs::rename(&old_path, &new_path)?;
-        }
+        let old_file_name = metadata_file.notes[index].file_name.clone();
+        let old_path = self.note_path_in_category(&old_file_name, &old_category);
+        // 目标分类可能已有同名笔记：沿用当前文件名主干，必要时加 ` (n)` 后缀。
+        // 名字靠 `create_new` 抢占，抢不到就顺延，因此不会覆盖目标分类里的同名笔记
+        let stem = file_stem_of(&old_file_name).to_string();
+        let (new_file_name, new_path) = if old_path.exists() {
+            let mut claim =
+                self.claim_new_path(&metadata_file, id, &stem, new_category, Some(&old_path))?;
+            self.fill_claim_from_source(&mut claim, &old_path)?;
+            (claim.file_name.clone(), claim.path.clone())
+        } else {
+            // 源文件已被外部删掉：只修正索引，不凭空造一个空笔记
+            let file_name = self.file_name_for_stem(&metadata_file, id, &stem, new_category, None);
+            let path = self.note_path_in_category(&file_name, new_category);
+            (file_name, path)
+        };
 
+        let note = &mut metadata_file.notes[index];
+        note.file_name = new_file_name;
         note.category = new_category.to_string();
         let result = note.clone();
         self.save_metadata(&metadata_file)?;
+        // 与旧版 `rename` 的可见效果对齐：跨分类移动不留回收站副本
+        self.drop_replaced_file(&old_path, &new_path, false);
         Ok(result)
     }
 
@@ -1292,12 +1393,17 @@ impl NoteStore {
         fs::create_dir_all(self.notes_dir())?;
         if !self.metadata_path().exists() {
             let metadata = self.rebuild_metadata()?;
+            // rebuild 能从 `UUID_标题.md` 捡回原 UUID，随后统一迁成可读文件名
+            let metadata = self.migrate_legacy_file_names(metadata)?;
             self.save_metadata(&metadata)?;
         } else {
             let metadata = self.load_metadata()?;
             if metadata.notes.is_empty() && self.notes_dir_has_md_files() {
                 let rebuilt = self.rebuild_metadata()?;
+                let rebuilt = self.migrate_legacy_file_names(rebuilt)?;
                 self.save_metadata(&rebuilt)?;
+            } else {
+                self.migrate_legacy_file_names(metadata)?;
             }
         }
         Ok(())
@@ -1324,13 +1430,276 @@ impl NoteStore {
             .ok_or_else(|| AppError::note_not_found(id))
     }
 
-    fn file_name_for(&self, id: &str, title: &str) -> String {
-        let safe_title = safe_file_stem(title);
-        if safe_title.is_empty() {
-            format!("{id}.md")
-        } else {
-            format!("{id}_{safe_title}.md")
+    /// 分类移动等「标题没变、只是换目录」的场景直接复用当前文件名主干，
+    /// 避免因为标题为空把 `abc.md` 顺手改成 `未命名.md`。
+    ///
+    /// 只用在不落盘的场景（如源文件已缺失、仅修正索引）；真正写盘一律走
+    /// `claim_new_path`，因为这里的「挑名字」和写入不是同一个原子步骤。
+    fn file_name_for_stem(
+        &self,
+        metadata: &MetadataFile,
+        id: &str,
+        stem: &str,
+        category: &str,
+        own_path: Option<&Path>,
+    ) -> String {
+        let mut index = 1usize;
+        loop {
+            let candidate = suffixed_file_name(stem, index);
+            if !self.file_name_taken(metadata, id, &candidate, category, own_path) {
+                return candidate;
+            }
+            index += 1;
+            if index > MAX_FILE_NAME_ATTEMPTS {
+                // 上千篇同名（几乎不可能）：退化成带完整 UUID 的文件名，
+                // 依然唯一，且仍然不覆盖任何既有文件
+                return format!("{stem} ({id}).md");
+            }
         }
+    }
+
+    /// 旧文件已不在时的候选名：只避开 metadata 已占用的名字。
+    /// 若目标名上正好有文件，那是上一次迁移改名后没落盘的遗留，直接认领。
+    fn file_name_for_missing_file(
+        &self,
+        metadata: &MetadataFile,
+        id: &str,
+        stem: &str,
+        category: &str,
+    ) -> String {
+        let mut index = 1usize;
+        loop {
+            let candidate = suffixed_file_name(stem, index);
+            let claimed = metadata.notes.iter().any(|note| {
+                note.id != id
+                    && note.category.eq_ignore_ascii_case(category)
+                    && note.file_name.eq_ignore_ascii_case(&candidate)
+            });
+            if !claimed {
+                return candidate;
+            }
+            index += 1;
+            if index > MAX_FILE_NAME_ATTEMPTS {
+                return format!("{stem} ({id}).md");
+            }
+        }
+    }
+
+    fn file_name_taken(
+        &self,
+        metadata: &MetadataFile,
+        id: &str,
+        candidate: &str,
+        category: &str,
+        own_path: Option<&Path>,
+    ) -> bool {
+        // metadata 是权威索引：即使对应文件暂时不存在（被外部删掉），
+        // 名字仍视为已占用，避免两条记录指向同一个物理文件
+        let taken_in_metadata = metadata.notes.iter().any(|note| {
+            note.id != id
+                && note.category.eq_ignore_ascii_case(category)
+                && note.file_name.eq_ignore_ascii_case(candidate)
+        });
+        if taken_in_metadata {
+            return true;
+        }
+
+        let path = self.note_path_in_category(candidate, category);
+        if !path.exists() {
+            return false;
+        }
+        // 目标已存在时，只有「就是本篇自己的文件」（大小写改名）才算不冲突
+        match own_path {
+            Some(own_path) => !paths_refer_to_same_entry(own_path, &path),
+            None => true,
+        }
+    }
+
+    /// 原子占用一个**新**物理路径，返回持有独占句柄的 claim。
+    ///
+    /// 候选名先按 metadata 索引 + 磁盘现状筛选，再用 `create_new` 真正抢名字：
+    /// 抢不到（`AlreadyExists`，可能来自另一个线程或另一个进程）就顺延到
+    /// `标题 (2).md`。因此「判断没人用」与「占用」是同一个原子步骤，不存在
+    /// 让别的写者插进来的窗口。`own_path` 指向本篇自己的文件时直接复用，
+    /// 允许正常覆盖自己的正文（含 Windows 上的大小写改名）。
+    fn claim_new_path(
+        &self,
+        metadata: &MetadataFile,
+        id: &str,
+        stem: &str,
+        category: &str,
+        own_path: Option<&Path>,
+    ) -> Result<PathClaim, AppError> {
+        let notes_dir = self.notes_dir();
+        // 分类目录可能还不存在；只在真正要落盘时建，避免纯索引操作留下空目录
+        if !category.is_empty() {
+            fs::create_dir_all(notes_dir.join(category))?;
+        }
+
+        for index in 1..=MAX_FILE_NAME_ATTEMPTS {
+            let candidate = suffixed_file_name(stem, index);
+            if self.file_name_taken(metadata, id, &candidate, category, own_path) {
+                continue;
+            }
+            let path = self.note_path_in_category(&candidate, category);
+            if let Some(own_path) = own_path {
+                if paths_refer_to_same_entry(own_path, &path) {
+                    return Ok(PathClaim::adopt_own_file(candidate, path));
+                }
+            }
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(file) => {
+                    return Ok(PathClaim {
+                        file_name: candidate,
+                        path,
+                        file: Some(file),
+                        created: true,
+                        filled: false,
+                    });
+                }
+                // 名字刚被别人抢走：换下一个后缀，绝不覆盖
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+
+        // 上千篇同名（几乎不可能）：退化成带完整 UUID 的名字，仍然靠 create_new 独占
+        let candidate = format!("{stem} ({id}).md");
+        let path = self.note_path_in_category(&candidate, category);
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
+        Ok(PathClaim {
+            file_name: candidate,
+            path,
+            file: Some(file),
+            created: true,
+            filled: false,
+        })
+    }
+
+    /// 把正文写进 claim。成功后 claim 才算「可提交」：调用方这时才被允许
+    /// 修改 metadata、清理旧文件。
+    fn fill_claim_with_content(
+        &self,
+        claim: &mut PathClaim,
+        content: &str,
+    ) -> Result<(), AppError> {
+        match claim.file.as_mut() {
+            Some(file) => file.write_all(content.as_bytes())?,
+            // 复用自己既有的文件：正常覆盖
+            None => fs::write(&claim.path, content)?,
+        }
+        claim.filled = true;
+        Ok(())
+    }
+
+    /// 把源文件内容搬进 claim，用于改名 / 跨分类移动。
+    ///
+    /// 刻意不用 `fs::rename`：Unix 上它会静默覆盖目标同名文件，Windows 上
+    /// 又会因为目标已存在（我们刚占的位）而失败，两边语义都不合用。
+    /// 「复制进已独占的目标 + 之后再删源」在两个平台上行为一致且无法覆盖他人。
+    fn fill_claim_from_source(&self, claim: &mut PathClaim, source: &Path) -> Result<(), AppError> {
+        let Some(target) = claim.file.as_mut() else {
+            // 目标就是源文件本身（大小写改名），无需搬运
+            return Ok(());
+        };
+        let mut source_file = fs::File::open(source)?;
+        io::copy(&mut source_file, target)?;
+        claim.filled = true;
+        Ok(())
+    }
+
+    /// 新文件与 metadata 都落定后，清掉旧路径上的副本。
+    ///
+    /// 失败只打日志：正文已经安全在新路径上，清理失败不能把保存报成失败。
+    /// `recycle` 为真时走回收站（用户可见的改名），否则直接移除
+    /// （跨分类移动，与旧版 `rename` 的可见效果一致）。
+    fn drop_replaced_file(&self, old_path: &Path, new_path: &Path, recycle: bool) {
+        if !old_path.exists() || paths_refer_to_same_entry(old_path, new_path) {
+            return;
+        }
+        if recycle {
+            let _ = recycle_path(old_path);
+            return;
+        }
+        if let Err(error) = fs::remove_file(old_path) {
+            eprintln!("failed to remove {}: {error}", old_path.display());
+        }
+    }
+
+    /// 把旧版 `UUID_标题.md` 迁移成可读文件名，`metadata.json` 里的 UUID 保持不变。
+    /// 幂等：名字已经不是旧格式时什么都不做。
+    fn migrate_legacy_file_names(
+        &self,
+        mut metadata: MetadataFile,
+    ) -> Result<MetadataFile, AppError> {
+        let mut changed = false;
+
+        for index in 0..metadata.notes.len() {
+            if !is_legacy_file_name(&metadata.notes[index].id, &metadata.notes[index].file_name) {
+                continue;
+            }
+
+            let id = metadata.notes[index].id.clone();
+            let title = metadata.notes[index].title.clone();
+            let old_file_name = metadata.notes[index].file_name.clone();
+            let category = metadata.notes[index].category.clone();
+            let stem = stem_from_title(&title)
+                .or_else(|| legacy_title_stem(&old_file_name))
+                .unwrap_or_else(|| DEFAULT_NOTE_STEM.to_string());
+            let old_path = self.note_path_in_category(&old_file_name, &category);
+            let new_file_name = if old_path.exists() {
+                self.file_name_for_stem(&metadata, &id, &stem, &category, Some(&old_path))
+            } else {
+                // 上一次迁移改名成功但没来得及落盘索引（进程被杀）：
+                // 目标名是确定性推导出来的，认领即可，避免笔记从列表里消失
+                self.file_name_for_missing_file(&metadata, &id, &stem, &category)
+            };
+            if new_file_name == old_file_name {
+                continue;
+            }
+
+            let new_path = self.note_path_in_category(&new_file_name, &category);
+            if !old_path.exists() {
+                metadata.notes[index].file_name = new_file_name;
+                changed = true;
+                continue;
+            }
+            if paths_refer_to_same_entry(&old_path, &new_path) {
+                continue;
+            }
+            if new_path.exists() {
+                // 目标被 metadata 之外的文件占用：跳过重命名，保留原名可用
+                eprintln!(
+                    "skip migrating {}: target {} already exists",
+                    old_path.display(),
+                    new_path.display()
+                );
+                continue;
+            }
+            if let Err(error) = fs::rename(&old_path, &new_path) {
+                eprintln!(
+                    "failed to migrate note file {} -> {}: {error}",
+                    old_path.display(),
+                    new_path.display()
+                );
+                continue;
+            }
+
+            metadata.notes[index].file_name = new_file_name;
+            changed = true;
+        }
+
+        if changed {
+            self.save_metadata(&metadata)?;
+        }
+        Ok(metadata)
     }
 
     fn load_metadata(&self) -> Result<MetadataFile, AppError> {
@@ -1421,9 +1790,9 @@ impl NoteStore {
             }
 
             let file_name = entry.file_name().to_string_lossy().to_string();
-            let Some(id) = id_from_file_name(&file_name) else {
-                continue;
-            };
+            // 旧版 `UUID_标题.md` 能捡回原 UUID；可读文件名不含身份，
+            // 只能生成新 UUID —— 这是 metadata 丢失后的降级恢复（图片目录会脱钩）
+            let id = id_from_file_name(&file_name).unwrap_or_else(|| Uuid::new_v4().to_string());
             let content = fs::read_to_string(&path).unwrap_or_default();
             let title = infer_title(&file_name, &content);
             let modified = entry
@@ -1585,31 +1954,100 @@ fn shortcuts_equal(left: &str, right: &str) -> bool {
     normalize(left) == normalize(right)
 }
 
+/// Windows 文件名禁用字符之外，还禁用「末尾空格或点」与保留设备名。
+/// 保留空格：文件名是给人看的（`2025 完型.md`），不再用 `_` 顶替空格。
 fn safe_file_stem(title: &str) -> String {
     let mut stem = String::new();
-    let mut last_was_separator = false;
 
     for ch in title.trim().chars() {
-        let should_separate = ch.is_whitespace()
-            || matches!(ch, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*')
-            || ch.is_control();
-
-        if should_separate {
-            if !stem.is_empty() && !last_was_separator {
-                stem.push('_');
-                last_was_separator = true;
-            }
+        if ch.is_control() {
             continue;
         }
-
-        stem.push(ch);
-        last_was_separator = false;
-        if stem.chars().count() >= 48 {
+        if matches!(ch, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*') {
+            stem.push('_');
+        } else {
+            stem.push(ch);
+        }
+        if stem.chars().count() >= MAX_NOTE_STEM_CHARS {
             break;
         }
     }
 
-    stem.trim_matches('_').to_string()
+    let stem = stem.trim_matches(|ch: char| ch == '.' || ch.is_whitespace() || ch == '_');
+    if stem.is_empty() {
+        return String::new();
+    }
+    if is_windows_reserved_stem(stem) {
+        // `CON.md` 在 Windows 上依然是保留设备名，追加后缀即可正常落盘
+        return format!("{stem}_");
+    }
+    stem.to_string()
+}
+
+/// 标题 → 文件名主干；空标题回落 `未命名`，由调用方补 `.md`。
+fn stem_from_title(title: &str) -> Option<String> {
+    let stem = safe_file_stem(title);
+    (!stem.is_empty()).then_some(stem)
+}
+
+fn note_stem(title: &str) -> String {
+    stem_from_title(title).unwrap_or_else(|| DEFAULT_NOTE_STEM.to_string())
+}
+
+/// 去掉 `.md` 后缀；非 `.md` 原样返回。
+fn file_stem_of(file_name: &str) -> &str {
+    file_name
+        .strip_suffix(".md")
+        .or_else(|| file_name.strip_suffix(".MD"))
+        .unwrap_or(file_name)
+}
+
+/// 第 `index` 个候选文件名：1 → `标题.md`，2 → `标题 (2).md`。
+/// 命名公式集中在这里，避免「挑名字」和「抢名字」两条路径给出不同的候选。
+fn suffixed_file_name(stem: &str, index: usize) -> String {
+    if index <= 1 {
+        format!("{stem}.md")
+    } else {
+        format!("{stem} ({index}).md")
+    }
+}
+
+fn is_windows_reserved_stem(stem: &str) -> bool {
+    const RESERVED: &[&str] = &[
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    ];
+    let upper = stem
+        .trim_end_matches(|ch: char| ch == '.' || ch == ' ')
+        .to_ascii_uppercase();
+    RESERVED.iter().any(|reserved| *reserved == upper.as_str())
+}
+
+/// 旧命名 `UUID_标题.md`：前缀必须是合法 UUID，否则视为普通可读文件名。
+/// 这是 `infer_title` 不再按第一个 `_` 切分的替代判据。
+fn legacy_uuid_prefix(file_name: &str) -> Option<(String, &str)> {
+    let stem = file_stem_of(file_name);
+    let (prefix, rest) = stem.split_once('_')?;
+    let uuid = Uuid::parse_str(prefix).ok()?;
+    if rest.trim().is_empty() {
+        return None;
+    }
+    Some((uuid.to_string(), rest))
+}
+
+fn is_legacy_file_name(id: &str, file_name: &str) -> bool {
+    let stem = file_stem_of(file_name);
+    match stem.split_once('_') {
+        Some((prefix, rest)) => !rest.trim().is_empty() && prefix.eq_ignore_ascii_case(id),
+        None => false,
+    }
+}
+
+/// 迁移时 metadata 里的标题为空，就退回旧文件名里的可读部分，
+/// 避免把 `UUID_2025完型.md` 变成 `未命名.md`
+fn legacy_title_stem(file_name: &str) -> Option<String> {
+    let (_, rest) = legacy_uuid_prefix(file_name)?;
+    stem_from_title(&rest.replace('_', " "))
 }
 
 fn count_words(content: &str) -> usize {
@@ -1626,13 +2064,11 @@ fn preview(content: &str) -> String {
         .collect()
 }
 
+/// 从文件名恢复 UUID —— 只认旧版 `UUID_标题.md` 布局。
+/// 可读文件名不含身份信息，返回 `None`，由调用方生成新 UUID
+/// （metadata 丢失后的降级恢复，见 `rebuild_metadata`）。
 fn id_from_file_name(file_name: &str) -> Option<String> {
-    let stem = file_name.strip_suffix(".md")?;
-    Some(
-        stem.split_once('_')
-            .map(|(id, _)| id.to_string())
-            .unwrap_or_else(|| stem.to_string()),
-    )
+    legacy_uuid_prefix(file_name).map(|(id, _)| id)
 }
 
 fn infer_title(file_name: &str, content: &str) -> String {
@@ -1644,10 +2080,13 @@ fn infer_title(file_name: &str, content: &str) -> String {
         return title.to_string();
     }
 
-    let stem = file_name.strip_suffix(".md").unwrap_or(file_name);
-    stem.split_once('_')
-        .map(|(_, title)| title.replace('_', " "))
-        .unwrap_or_default()
+    // 不再按「第一个 `_`」切：只有确认前缀是 UUID 才剥掉，
+    // `我的_读书_笔记.md` 的标题必须完整保留
+    if let Some((_, rest)) = legacy_uuid_prefix(file_name) {
+        return rest.replace('_', " ");
+    }
+
+    file_stem_of(file_name).trim().to_string()
 }
 
 fn is_markdown_path(path: &Path) -> bool {
@@ -1760,7 +2199,25 @@ fn default_locale() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{fs, path::PathBuf};
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        sync::{Arc, Barrier},
+        thread,
+    };
+
+    /// 目录下的 `.md` 文件名（不递归），用于断言没有多出 / 少掉文件。
+    fn md_file_names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .expect("read dir")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.path().is_file())
+            .filter_map(|entry| entry.file_name().to_str().map(str::to_string))
+            .filter(|name| name.ends_with(".md"))
+            .collect();
+        names.sort();
+        names
+    }
 
     fn test_root(name: &str) -> PathBuf {
         let base = std::env::var_os("FLORAL_NOTEPAPER_TEST_TEMP_DIR")
@@ -1852,11 +2309,20 @@ mod tests {
         fs::write(store.metadata_path(), "{ broken json").expect("corrupt metadata");
 
         let repaired = store.list_notes().expect("repair metadata");
-        let ids: Vec<_> = repaired.iter().map(|note| note.id.as_str()).collect();
+        let mut titles: Vec<_> = repaired.iter().map(|note| note.title.as_str()).collect();
+        titles.sort_unstable();
 
         assert_eq!(repaired.len(), 2);
-        assert!(ids.contains(&first.id.as_str()));
-        assert!(ids.contains(&second.id.as_str()));
+        assert_eq!(titles, vec!["第一条", "第二条"]);
+
+        // M2.0 的已知降级：可读文件名不再携带身份，metadata 损坏后只能重建出
+        // 新 UUID（旧 id 只存在于已损坏的 metadata / 图片目录里）。
+        // 文件与正文不会丢，但 images/{旧 id}/ 下的图片会脱钩。
+        assert!(repaired
+            .iter()
+            .all(|note| Uuid::parse_str(&note.id).is_ok()));
+        assert!(repaired.iter().all(|note| note.id != first.id));
+        assert!(repaired.iter().all(|note| note.id != second.id));
 
         // 损坏文件被备份保留，供事后取证分析
         let corrupt_backup = fs::read_dir(store.data_dir())
@@ -2429,6 +2895,800 @@ mod tests {
 
         assert_eq!(imported.title, "会议记录");
         assert_eq!(imported.content, source_content);
+    }
+
+    #[test]
+    fn sanitizes_titles_into_windows_safe_file_stems() {
+        assert_eq!(safe_file_stem("2025 完型"), "2025 完型");
+        assert_eq!(safe_file_stem("A/B:C*D?E"), "A_B_C_D_E");
+        assert_eq!(safe_file_stem("  首尾空格  "), "首尾空格");
+        assert_eq!(safe_file_stem("结尾点..."), "结尾点");
+        assert_eq!(safe_file_stem("CON"), "CON_");
+        assert_eq!(safe_file_stem("nul.txt"), "nul.txt");
+        assert_eq!(safe_file_stem(""), "");
+        assert_eq!(safe_file_stem("///"), "");
+        assert_eq!(stem_from_title("  "), None);
+        assert_eq!(note_stem(""), DEFAULT_NOTE_STEM);
+        assert_eq!(safe_file_stem(&"长".repeat(80)).chars().count(), 60);
+    }
+
+    #[test]
+    fn writes_readable_file_names_while_keeping_uuid_identity() {
+        let store = test_store("readable-name");
+
+        let note = store
+            .create_note(SaveNoteRequest {
+                title: "2025 完型".into(),
+                content: "正文".into(),
+                category: String::new(),
+            })
+            .expect("create note");
+
+        assert_eq!(note.file_name, "2025 完型.md");
+        assert!(Uuid::parse_str(&note.id).is_ok(), "id 仍是 UUID");
+        assert!(store.notes_dir().join("2025 完型.md").exists());
+    }
+
+    #[test]
+    fn keeps_duplicate_titles_unique_without_overwriting() {
+        let store = test_store("duplicate-titles");
+
+        let first = store
+            .create_note(SaveNoteRequest {
+                title: "会议记录".into(),
+                content: "第一篇".into(),
+                category: String::new(),
+            })
+            .expect("create first");
+        let second = store
+            .create_note(SaveNoteRequest {
+                title: "会议记录".into(),
+                content: "第二篇".into(),
+                category: String::new(),
+            })
+            .expect("create second");
+
+        assert_eq!(first.file_name, "会议记录.md");
+        assert_eq!(second.file_name, "会议记录 (2).md");
+        assert_ne!(first.id, second.id);
+
+        // 两篇内容各自落盘，绝不允许后者覆盖前者
+        assert_eq!(
+            fs::read_to_string(store.notes_dir().join("会议记录.md")).expect("read first"),
+            "第一篇"
+        );
+        assert_eq!(
+            fs::read_to_string(store.notes_dir().join("会议记录 (2).md")).expect("read second"),
+            "第二篇"
+        );
+        assert_eq!(
+            store.read_note(&first.id).expect("read by id").content,
+            "第一篇"
+        );
+        assert_eq!(store.list_notes().expect("list").len(), 2);
+    }
+
+    #[test]
+    fn uses_unnamed_stem_for_empty_title() {
+        let store = test_store("untitled");
+
+        let first = store
+            .create_note(SaveNoteRequest {
+                title: "   ".into(),
+                content: "a".into(),
+                category: String::new(),
+            })
+            .expect("create first");
+        let second = store
+            .create_note(SaveNoteRequest {
+                title: String::new(),
+                content: "b".into(),
+                category: String::new(),
+            })
+            .expect("create second");
+
+        assert_eq!(first.file_name, "未命名.md");
+        assert_eq!(second.file_name, "未命名 (2).md");
+    }
+
+    #[test]
+    fn renames_file_on_title_change_keeping_id() {
+        let store = test_store("rename-keeps-id");
+
+        let note = store
+            .create_note(SaveNoteRequest {
+                title: "旧标题".into(),
+                content: "旧内容".into(),
+                category: String::new(),
+            })
+            .expect("create note");
+        // 图片目录始终以 UUID 为 key，改名不应影响
+        let image_ref = store
+            .save_image(&note.id, b"png-bytes", "png")
+            .expect("save image");
+
+        let updated = store
+            .update_note(
+                &note.id,
+                SaveNoteRequest {
+                    title: "新标题".into(),
+                    content: format!("新内容\n![]({image_ref})"),
+                    category: String::new(),
+                },
+            )
+            .expect("rename note");
+
+        assert_eq!(updated.id, note.id, "UUID 不随改名变化");
+        assert_eq!(updated.file_name, "新标题.md");
+        assert_eq!(
+            fs::read_to_string(store.notes_dir().join("新标题.md")).expect("read renamed file"),
+            format!("新内容\n![]({image_ref})")
+        );
+        assert!(image_ref.starts_with(&format!("images/{}/", note.id)));
+        assert!(store.images_dir(&note.id).exists(), "图片目录不随改名变化");
+        assert_eq!(store.list_notes().expect("list").len(), 1);
+        assert_eq!(
+            store.read_note(&note.id).expect("read by id").title,
+            "新标题"
+        );
+    }
+
+    #[test]
+    fn rename_into_taken_title_gets_suffix_without_overwriting() {
+        let store = test_store("rename-collision");
+        let first = store
+            .create_note(SaveNoteRequest {
+                title: "草稿".into(),
+                content: "第一篇".into(),
+                category: String::new(),
+            })
+            .expect("create first");
+        let second = store
+            .create_note(SaveNoteRequest {
+                title: "终稿".into(),
+                content: "第二篇".into(),
+                category: String::new(),
+            })
+            .expect("create second");
+
+        let renamed = store
+            .update_note(
+                &first.id,
+                SaveNoteRequest {
+                    title: "终稿".into(),
+                    content: "第一篇改".into(),
+                    category: String::new(),
+                },
+            )
+            .expect("rename into taken title");
+
+        assert_eq!(renamed.id, first.id);
+        assert_eq!(renamed.file_name, "终稿 (2).md");
+        assert_eq!(
+            store.read_note(&second.id).expect("read second").content,
+            "第二篇",
+            "已存在的同名笔记不能被改名覆盖"
+        );
+        assert_eq!(
+            store.read_note(&first.id).expect("read first").content,
+            "第一篇改"
+        );
+        assert_eq!(store.list_notes().expect("list").len(), 2);
+    }
+
+    #[test]
+    fn keeps_underscores_and_spaces_in_file_names() {
+        let store = test_store("underscore-title");
+
+        let note = store
+            .create_note(SaveNoteRequest {
+                title: "我的_读书_笔记".into(),
+                content: "正文".into(),
+                category: String::new(),
+            })
+            .expect("create note");
+
+        assert_eq!(note.file_name, "我的_读书_笔记.md");
+        assert!(store.notes_dir().join("我的_读书_笔记.md").exists());
+    }
+
+    #[test]
+    fn migrates_legacy_uuid_file_names_keeping_metadata_id() {
+        let store = test_store("migrate-legacy-names");
+        let note = store
+            .create_note(SaveNoteRequest {
+                title: "旧命名笔记".into(),
+                content: "正文".into(),
+                category: String::new(),
+            })
+            .expect("create note");
+
+        // 手工退回旧版布局：UUID_标题.md
+        let mut metadata = store.load_metadata().expect("load metadata");
+        let current_path = store.note_path_in_category(&note.file_name, "");
+        let legacy_name = format!("{}_{}.md", note.id, "旧命名笔记");
+        let legacy_path = store.notes_dir().join(&legacy_name);
+        fs::rename(&current_path, &legacy_path).expect("rewind to legacy name");
+        metadata.notes[0].file_name = legacy_name;
+        store
+            .save_metadata(&metadata)
+            .expect("save legacy metadata");
+
+        let listed = store.list_notes().expect("list triggers migration");
+
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, note.id, "迁移后 UUID 不变");
+        assert_eq!(listed[0].file_name, "旧命名笔记.md");
+        assert!(!legacy_path.exists(), "旧文件应已改名");
+        assert!(store.notes_dir().join("旧命名笔记.md").exists());
+    }
+
+    #[test]
+    fn migrates_legacy_names_without_losing_duplicate_titles() {
+        let store = test_store("migrate-legacy-duplicates");
+        let first = store
+            .create_note(SaveNoteRequest {
+                title: "重名".into(),
+                content: "一".into(),
+                category: String::new(),
+            })
+            .expect("create first");
+        let second = store
+            .create_note(SaveNoteRequest {
+                title: "重名".into(),
+                content: "二".into(),
+                category: String::new(),
+            })
+            .expect("create second");
+
+        // 两篇都回退成旧命名，再同时迁移：必须落成 重名.md / 重名 (2).md
+        let mut metadata = store.load_metadata().expect("load metadata");
+        for note in metadata.notes.iter_mut() {
+            let current_path = store.note_path_in_category(&note.file_name, "");
+            let legacy_name = format!("{}_{}.md", note.id, "重名");
+            fs::rename(&current_path, store.notes_dir().join(&legacy_name))
+                .expect("rewind to legacy name");
+            note.file_name = legacy_name;
+        }
+        store
+            .save_metadata(&metadata)
+            .expect("save legacy metadata");
+
+        let listed = store.list_notes().expect("list triggers migration");
+        let mut names: Vec<_> = listed.iter().map(|note| note.file_name.clone()).collect();
+        names.sort();
+
+        assert_eq!(
+            names,
+            vec!["重名 (2).md".to_string(), "重名.md".to_string()]
+        );
+        assert_eq!(
+            store.read_note(&first.id).expect("read first").content,
+            "一"
+        );
+        assert_eq!(
+            store.read_note(&second.id).expect("read second").content,
+            "二"
+        );
+    }
+
+    #[test]
+    fn adopts_file_when_previous_migration_renamed_but_did_not_save() {
+        let store = test_store("migration-crash-recovery");
+        let note = store
+            .create_note(SaveNoteRequest {
+                title: "半途".into(),
+                content: "正文".into(),
+                category: String::new(),
+            })
+            .expect("create note");
+
+        // 模拟：文件已经改成可读名，但 metadata 还停在旧名（迁移中途进程被杀）
+        let mut metadata = store.load_metadata().expect("load metadata");
+        metadata.notes[0].file_name = format!("{}_{}.md", note.id, "半途");
+        store.save_metadata(&metadata).expect("save stale metadata");
+
+        let listed = store.list_notes().expect("list triggers migration");
+
+        assert_eq!(listed.len(), 1, "笔记不能因为迁移中断而消失");
+        assert_eq!(listed[0].id, note.id);
+        assert_eq!(listed[0].file_name, "半途.md");
+    }
+
+    #[test]
+    fn rebuild_recovers_uuid_from_legacy_file_names() {
+        let store = test_store("rebuild-legacy-uuid");
+        let note = store
+            .create_note(SaveNoteRequest {
+                title: "旧笔记".into(),
+                content: "正文".into(),
+                category: String::new(),
+            })
+            .expect("create note");
+
+        let mut metadata = store.load_metadata().expect("load metadata");
+        let current_path = store.note_path_in_category(&note.file_name, "");
+        let legacy_name = format!("{}_{}.md", note.id, "旧笔记");
+        fs::rename(&current_path, store.notes_dir().join(&legacy_name))
+            .expect("rewind to legacy name");
+        metadata.notes[0].file_name = legacy_name;
+        store.save_metadata(&metadata).expect("save metadata");
+        fs::remove_file(store.metadata_path()).expect("drop metadata");
+
+        let listed = store.list_notes().expect("rebuild metadata");
+
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, note.id, "旧文件名里的 UUID 被完整恢复");
+        assert_eq!(listed[0].file_name, "旧笔记.md");
+    }
+
+    #[test]
+    fn rebuild_generates_new_id_for_readable_file_names() {
+        let store = test_store("rebuild-readable");
+        let note = store
+            .create_note(SaveNoteRequest {
+                title: "可读名".into(),
+                content: "正文".into(),
+                category: String::new(),
+            })
+            .expect("create note");
+
+        fs::remove_file(store.metadata_path()).expect("drop metadata");
+
+        let listed = store.list_notes().expect("rebuild metadata");
+
+        assert_eq!(listed.len(), 1, "可读文件名不应被 rebuild 丢掉");
+        assert_ne!(listed[0].id, note.id, "身份不可恢复时生成新 UUID");
+        assert!(Uuid::parse_str(&listed[0].id).is_ok(), "新 id 仍是 UUID");
+        assert_eq!(listed[0].title, "可读名");
+        assert_eq!(listed[0].file_name, "可读名.md");
+    }
+
+    #[test]
+    fn infers_title_without_splitting_on_first_underscore() {
+        assert_eq!(infer_title("我的_读书_笔记.md", ""), "我的_读书_笔记");
+        assert_eq!(
+            infer_title("76092fc5-1d2e-4a3b-8c4d-5e6f7a8b9c0d_2025完型.md", ""),
+            "2025完型"
+        );
+        assert_eq!(infer_title("2025 完型.md", "# 标题优先\n正文"), "标题优先");
+        assert_eq!(id_from_file_name("我的_读书_笔记.md"), None);
+        assert_eq!(
+            id_from_file_name("76092fc5-1d2e-4a3b-8c4d-5e6f7a8b9c0d_2025完型.md").as_deref(),
+            Some("76092fc5-1d2e-4a3b-8c4d-5e6f7a8b9c0d")
+        );
+    }
+
+    #[test]
+    fn moves_note_to_category_without_overwriting_same_name() {
+        let store = test_store("move-category-collision");
+        let root_note = store
+            .create_note(SaveNoteRequest {
+                title: "同名".into(),
+                content: "根目录".into(),
+                category: String::new(),
+            })
+            .expect("create root note");
+        let category_note = store
+            .create_note(SaveNoteRequest {
+                title: "同名".into(),
+                content: "分类内".into(),
+                category: "工作".into(),
+            })
+            .expect("create category note");
+
+        assert_eq!(root_note.file_name, "同名.md");
+        assert_eq!(category_note.file_name, "同名.md");
+
+        let moved = store
+            .move_note_to_category(&root_note.id, "工作")
+            .expect("move note");
+
+        assert_eq!(moved.category, "工作");
+        assert_eq!(moved.file_name, "同名 (2).md");
+        assert_eq!(
+            store
+                .read_note(&category_note.id)
+                .expect("read category note")
+                .content,
+            "分类内",
+            "同名笔记不能被移动覆盖"
+        );
+        assert_eq!(
+            store
+                .read_note(&root_note.id)
+                .expect("read moved note")
+                .content,
+            "根目录"
+        );
+    }
+
+    #[test]
+    fn concurrent_creates_with_same_title_never_overwrite() {
+        let store = Arc::new(test_store("concurrent-create-same-title"));
+        // 预热：目录与 metadata 已就绪，竞争只发生在「抢名字 + 写正文」
+        store.list_notes().expect("warm up");
+
+        let bodies = ["甲篇", "乙篇", "丙篇", "丁篇"];
+        let barrier = Arc::new(Barrier::new(bodies.len()));
+        let handles: Vec<_> = bodies
+            .iter()
+            .map(|body| {
+                let store = Arc::clone(&store);
+                let barrier = Arc::clone(&barrier);
+                let body = body.to_string();
+                thread::spawn(move || {
+                    // 所有线程同一时刻起跑，真正同时争抢 `并发撞名.md`
+                    barrier.wait();
+                    store
+                        .create_note(SaveNoteRequest {
+                            title: "并发撞名".into(),
+                            content: body,
+                            category: String::new(),
+                        })
+                        .expect("create under contention")
+                })
+            })
+            .collect();
+
+        let created: Vec<Note> = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("join create thread"))
+            .collect();
+
+        let mut names: Vec<String> = created.iter().map(|note| note.file_name.clone()).collect();
+        names.sort();
+        let mut expected: Vec<String> = vec!["并发撞名.md".to_string()];
+        for index in 2..=bodies.len() {
+            expected.push(format!("并发撞名 ({index}).md"));
+        }
+        expected.sort();
+        assert_eq!(names, expected, "同名的并发创建必须落成互不相同的文件");
+        assert_eq!(md_file_names(&store.notes_dir()), expected);
+
+        // 每篇正文都完整留在自己名下，且索引指向的就是自己那份
+        let mut bodies_on_disk = Vec::new();
+        for note in &created {
+            let on_disk = fs::read_to_string(store.notes_dir().join(&note.file_name))
+                .expect("read note file");
+            assert_eq!(
+                on_disk, note.content,
+                "{} 的正文被别的线程覆盖了",
+                note.file_name
+            );
+            assert_eq!(
+                store.read_note(&note.id).expect("read by id").content,
+                note.content,
+                "{} 的索引指向了错误的文件",
+                note.id
+            );
+            bodies_on_disk.push(on_disk);
+        }
+        bodies_on_disk.sort();
+        let mut expected_bodies: Vec<String> = bodies.iter().map(|body| body.to_string()).collect();
+        expected_bodies.sort();
+        assert_eq!(bodies_on_disk, expected_bodies, "四篇正文一篇都不能丢");
+
+        let mut ids: Vec<&str> = created.iter().map(|note| note.id.as_str()).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), bodies.len(), "UUID 必须彼此独立");
+    }
+
+    /// 直接压 `claim_new_path`：两边都拿一份**空索引**（模拟读到的过期快照），
+    /// 谁都不认为名字被占用。此时能阻止覆盖的只剩 `create_new` 本身。
+    #[test]
+    fn competing_claims_on_stale_metadata_get_distinct_files() {
+        let store = Arc::new(test_store("concurrent-claim-stale-index"));
+        store.list_notes().expect("warm up");
+        let notes_dir = store.notes_dir();
+
+        for round in 0..25 {
+            let stem = format!("抢占{round}");
+            let barrier = Arc::new(Barrier::new(2));
+            let handles: Vec<_> = ["左", "右"]
+                .iter()
+                .map(|side| {
+                    let store = Arc::clone(&store);
+                    let barrier = Arc::clone(&barrier);
+                    let stem = stem.clone();
+                    let side = side.to_string();
+                    thread::spawn(move || {
+                        let metadata = MetadataFile::default();
+                        let id = Uuid::new_v4().to_string();
+                        barrier.wait();
+                        let mut claim = store
+                            .claim_new_path(&metadata, &id, &stem, "", None)
+                            .expect("claim path");
+                        store
+                            .fill_claim_with_content(&mut claim, &side)
+                            .expect("fill claim");
+                        (claim.file_name.clone(), side)
+                    })
+                })
+                .collect();
+
+            let claimed: Vec<(String, String)> = handles
+                .into_iter()
+                .map(|handle| handle.join().expect("join claim thread"))
+                .collect();
+
+            assert_ne!(
+                claimed[0].0, claimed[1].0,
+                "第 {round} 轮：两个写者拿到了同一个文件"
+            );
+            for (file_name, side) in &claimed {
+                assert_eq!(
+                    fs::read_to_string(notes_dir.join(file_name)).expect("read claimed file"),
+                    *side,
+                    "第 {round} 轮：{file_name} 的正文被另一个写者覆盖"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn claim_skips_file_the_index_does_not_know_about() {
+        let store = test_store("claim-unindexed-intruder");
+        store.list_notes().expect("warm up");
+        // 模拟「另一个写者刚建好文件、索引还没落盘」的瞬间
+        fs::write(store.notes_dir().join("外来.md"), "别人写的").expect("intruder file");
+
+        let metadata = MetadataFile::default();
+        let mut claim = store
+            .claim_new_path(
+                &metadata,
+                "00000000-0000-4000-8000-000000000000",
+                "外来",
+                "",
+                None,
+            )
+            .expect("claim path");
+        store
+            .fill_claim_with_content(&mut claim, "我写的")
+            .expect("fill claim");
+
+        assert_eq!(claim.file_name, "外来 (2).md");
+        assert_eq!(
+            fs::read_to_string(store.notes_dir().join("外来.md")).expect("read intruder file"),
+            "别人写的",
+            "索引里没有记录、但磁盘上已存在的文件同样不能被覆盖"
+        );
+    }
+
+    #[test]
+    fn saving_own_file_overwrites_in_place_without_new_suffix() {
+        let store = test_store("save-own-file");
+
+        let note = store
+            .create_note(SaveNoteRequest {
+                title: "日记".into(),
+                content: "第一版".into(),
+                category: String::new(),
+            })
+            .expect("create note");
+        assert_eq!(note.file_name, "日记.md");
+
+        let saved = store
+            .update_note(
+                &note.id,
+                SaveNoteRequest {
+                    title: "日记".into(),
+                    content: "第二版".into(),
+                    category: String::new(),
+                },
+            )
+            .expect("save own file");
+
+        assert_eq!(saved.file_name, "日记.md", "保存自己的文件不该另起名字");
+        assert_eq!(
+            fs::read_to_string(store.notes_dir().join("日记.md")).expect("read saved file"),
+            "第二版"
+        );
+        assert_eq!(
+            md_file_names(&store.notes_dir()),
+            vec!["日记.md".to_string()],
+            "原地保存不能留下副本"
+        );
+    }
+
+    #[test]
+    fn concurrent_renames_into_same_title_keep_both_bodies() {
+        let store = Arc::new(test_store("concurrent-rename-same-title"));
+        let first = store
+            .create_note(SaveNoteRequest {
+                title: "甲".into(),
+                content: "旧一".into(),
+                category: String::new(),
+            })
+            .expect("create first");
+        let second = store
+            .create_note(SaveNoteRequest {
+                title: "乙".into(),
+                content: "旧二".into(),
+                category: String::new(),
+            })
+            .expect("create second");
+
+        let barrier = Arc::new(Barrier::new(2));
+        let handles: Vec<_> = [
+            (first.id.clone(), "第一篇".to_string()),
+            (second.id.clone(), "第二篇".to_string()),
+        ]
+        .into_iter()
+        .map(|(id, body)| {
+            let store = Arc::clone(&store);
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                store
+                    .update_note(
+                        &id,
+                        SaveNoteRequest {
+                            title: "同名终稿".into(),
+                            content: body,
+                            category: String::new(),
+                        },
+                    )
+                    .expect("rename under contention")
+            })
+        })
+        .collect();
+
+        let renamed: Vec<Note> = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("join rename thread"))
+            .collect();
+
+        let mut names: Vec<String> = renamed.iter().map(|note| note.file_name.clone()).collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec!["同名终稿 (2).md".to_string(), "同名终稿.md".to_string()]
+        );
+        for note in &renamed {
+            assert_eq!(
+                fs::read_to_string(store.notes_dir().join(&note.file_name))
+                    .expect("read renamed file"),
+                note.content,
+                "改名冲突时正文被覆盖"
+            );
+        }
+        assert_eq!(md_file_names(&store.notes_dir()), names);
+    }
+
+    #[test]
+    fn concurrent_moves_into_same_category_do_not_overwrite() {
+        let store = Arc::new(test_store("concurrent-move-collision"));
+        let left = store
+            .create_note(SaveNoteRequest {
+                title: "同名".into(),
+                content: "左边正文".into(),
+                category: "左箱".into(),
+            })
+            .expect("create left");
+        let right = store
+            .create_note(SaveNoteRequest {
+                title: "同名".into(),
+                content: "右边正文".into(),
+                category: "右箱".into(),
+            })
+            .expect("create right");
+        assert_eq!(left.file_name, "同名.md");
+        assert_eq!(right.file_name, "同名.md");
+
+        let barrier = Arc::new(Barrier::new(2));
+        let handles: Vec<_> = [left.id.clone(), right.id.clone()]
+            .into_iter()
+            .map(|id| {
+                let store = Arc::clone(&store);
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    store
+                        .move_note_to_category(&id, "归档")
+                        .expect("move under contention")
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().expect("join move thread");
+        }
+
+        let moved_left = store.read_note(&left.id).expect("read left");
+        let moved_right = store.read_note(&right.id).expect("read right");
+        assert_eq!(moved_left.content, "左边正文");
+        assert_eq!(moved_right.content, "右边正文");
+        assert_ne!(moved_left.file_name, moved_right.file_name);
+        assert_eq!(moved_left.category, "归档");
+        assert_eq!(moved_right.category, "归档");
+        assert_eq!(
+            md_file_names(&store.notes_dir().join("归档")).len(),
+            2,
+            "两篇各占一个文件"
+        );
+        assert!(
+            !store.notes_dir().join("左箱").join("同名.md").exists(),
+            "移动后旧位置不能残留副本"
+        );
+    }
+
+    #[test]
+    fn deleting_category_merges_into_root_without_overwriting() {
+        let store = test_store("delete-category-collision");
+        let root_note = store
+            .create_note(SaveNoteRequest {
+                title: "同名".into(),
+                content: "根目录".into(),
+                category: String::new(),
+            })
+            .expect("create root note");
+        let category_note = store
+            .create_note(SaveNoteRequest {
+                title: "同名".into(),
+                content: "分类内".into(),
+                category: "工作".into(),
+            })
+            .expect("create category note");
+        assert_eq!(root_note.file_name, "同名.md");
+        assert_eq!(category_note.file_name, "同名.md");
+
+        store.delete_category("工作").expect("delete category");
+
+        assert_eq!(
+            store.read_note(&root_note.id).expect("read root").content,
+            "根目录",
+            "根目录里的同名笔记不能被分类笔记覆盖"
+        );
+        let merged = store.read_note(&category_note.id).expect("read merged");
+        assert_eq!(merged.content, "分类内");
+        assert_eq!(merged.category, "");
+        assert_eq!(merged.file_name, "同名 (2).md");
+        assert_eq!(
+            md_file_names(&store.notes_dir()),
+            vec!["同名 (2).md".to_string(), "同名.md".to_string()]
+        );
+    }
+
+    /// 新路径抢不到时必须在改动任何东西之前失败：原稿、索引都不能被动过。
+    #[test]
+    fn failed_rename_keeps_original_note_intact() {
+        let store = test_store("failed-rename-keeps-original");
+        let note = store
+            .create_note(SaveNoteRequest {
+                title: "原稿".into(),
+                content: "不能丢的正文".into(),
+                category: String::new(),
+            })
+            .expect("create note");
+
+        // 用一个同名文件占住分类目录的位置，create_dir_all 必然失败
+        fs::write(store.notes_dir().join("坏分类"), "not a directory").expect("block category dir");
+
+        let error = store
+            .update_note(
+                &note.id,
+                SaveNoteRequest {
+                    title: "改名后".into(),
+                    content: "新正文".into(),
+                    category: "坏分类".into(),
+                },
+            )
+            .expect_err("rename into a blocked category must fail");
+        assert!(!error.message.is_empty());
+
+        let reloaded = store.read_note(&note.id).expect("original still readable");
+        assert_eq!(reloaded.content, "不能丢的正文");
+        assert_eq!(reloaded.file_name, "原稿.md");
+        assert_eq!(reloaded.category, "");
+        assert_eq!(
+            fs::read_to_string(store.notes_dir().join("原稿.md")).expect("read original file"),
+            "不能丢的正文"
+        );
+        assert_eq!(
+            md_file_names(&store.notes_dir()),
+            vec!["原稿.md".to_string()]
+        );
     }
 
     #[test]
